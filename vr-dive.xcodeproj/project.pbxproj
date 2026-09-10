@@ -19,6 +19,7 @@
 		9A9B19DC2ECF8286003DA309 /* Exceptions for "vr-dive" folder in "vr-dive" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
+				"Demos/DynamicBox/shaders/voxel-calabi-yau-quintic.metal",
 				"Demos/DynamicBox/shaders/voxel-roman-silk.metal",
 				"Demos/DynamicBox/shaders/voxel-logarithmic-conch.metal",
 				"Demos/DynamicBox/shaders/voxel-fibonacci-crown.metal",
