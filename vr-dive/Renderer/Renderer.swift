@@ -122,6 +122,7 @@ class Renderer {
       }
     }
 
+    // Wire the world map's live readout back to the UI panel.
     let requestedPattern = patternCoordinator.currentPattern()
     if controllers[requestedPattern] != nil || deferredPatternBuilders[requestedPattern] != nil {
       self.activePatternKind = requestedPattern
@@ -133,6 +134,15 @@ class Renderer {
       patternCoordinator.setPattern(deferredFallback)
     } else {
       fatalError("No render patterns available")
+    }
+
+    if let worldMap = controllers[.worldMap] as? WorldMapRenderer {
+      worldMap.statusSink = { [weak self] status in
+        self?.patternCoordinator.setMapStatus(status)
+      }
+      worldMap.coordinateSink = { [weak self] coordinate in
+        self?.patternCoordinator.setMapCurrentCoordinate(coordinate)
+      }
     }
   }
 
@@ -330,7 +340,12 @@ class Renderer {
           simoneOrbit3DPreset: patternCoordinator.simoneOrbit3DPreset(),
           infiniteZoomRate: patternCoordinator.infiniteZoomRate(),
           infiniteZoomDirection: patternCoordinator.infiniteZoomDirection(),
-          infiniteZoomQuality: patternCoordinator.infiniteZoomQuality()
+          infiniteZoomQuality: patternCoordinator.infiniteZoomQuality(),
+          mapFlightTier: patternCoordinator.mapFlightTier(),
+          mapDetailLevel: patternCoordinator.mapDetailLevel(),
+          mapRelocateRequest: patternCoordinator.mapRelocateRequest(),
+          mapRelocateGeneration: patternCoordinator.mapRelocateGeneration(),
+          mapImagerySource: patternCoordinator.mapImagerySource()
         )
         pattern?.synchronizeState(simulationContext)
 
@@ -764,10 +779,11 @@ class Renderer {
     // a jarring lurch that looks like uncontrolled "auto movement".
     let delta = min(max(0, currentTime - lastRigUpdateTime), 1.0 / 20.0)
     guard delta > 0 else { return }
+    let activePattern = patternCoordinator.currentPattern()
     rigTransform = gameManager.updateRigState(
       deltaTime: delta,
       headTransform: deviceAnchorTransform,
-      usesLargeWorldBoost: patternCoordinator.currentPattern() == .gyirongDebrisFlow)
+      usesLargeWorldBoost: activePattern == .gyirongDebrisFlow || activePattern == .worldMap)
     lastRigUpdateTime = currentTime
   }
 
@@ -987,6 +1003,17 @@ class Renderer {
       print("[Renderer] Gyirong debris-flow reconstruction pattern added.")
     } else {
       print("[Renderer] Gyirong debris-flow reconstruction unavailable (missing data?).")
+    }
+
+    if let worldMap = try? WorldMapRenderer(
+      device: device,
+      library: library,
+      maxViewCount: maxViewCount
+    ) {
+      controllers[.worldMap] = worldMap
+      print("[Renderer] Streaming satellite terrain map pattern added.")
+    } else {
+      print("[Renderer] Streaming satellite terrain map unavailable.")
     }
 
     if let tunnel = try? TunnelRenderer(

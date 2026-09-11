@@ -34,6 +34,11 @@ struct PatternSimulationContext {
   let infiniteZoomRate: Float
   let infiniteZoomDirection: Float
   let infiniteZoomQuality: InfiniteZoomQuality
+  let mapFlightTier: MapFlightTier
+  let mapDetailLevel: MapDetailLevel
+  let mapRelocateRequest: MapCoordinate?
+  let mapRelocateGeneration: Int
+  let mapImagerySource: MapImagerySource
 }
 
 struct PatternRenderContext {

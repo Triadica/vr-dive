@@ -107,6 +107,7 @@ enum VisualPatternKind: String, CaseIterable, Identifiable {
   case neonShells
   case lunarSurface
   case gyirongDebrisFlow
+  case worldMap
   case dynamicBox
   case infiniteMandelbulbZoom
 
@@ -251,6 +252,8 @@ enum VisualPatternKind: String, CaseIterable, Identifiable {
       return "月面日出"
     case .gyirongDebrisFlow:
       return "吉隆口岸泥石流（初步重建）"
+    case .worldMap:
+      return "卫星地形漫游（吉隆出发）"
     case .dynamicBox:
       return "动态着色器"
     case .magneticLinesThatDrawInGold:
@@ -733,6 +736,72 @@ final class PatternCoordinator {
   func dynamicBoxStatus() -> String {
     queue.sync { _dynamicBoxStatus }
   }
+
+  // ─── World map flight + status ───────────────────────────────────────────
+  private var _mapFlightTier: MapFlightTier = .cruise
+  private var _mapDetailLevel: MapDetailLevel = .standard
+  private var _mapStatus: String = ""
+
+  func mapFlightTier() -> MapFlightTier {
+    queue.sync { _mapFlightTier }
+  }
+
+  func setMapFlightTier(_ tier: MapFlightTier) {
+    queue.async(flags: .barrier) { self._mapFlightTier = tier }
+  }
+
+  func mapDetailLevel() -> MapDetailLevel {
+    queue.sync { _mapDetailLevel }
+  }
+
+  func setMapDetailLevel(_ level: MapDetailLevel) {
+    queue.async(flags: .barrier) { self._mapDetailLevel = level }
+  }
+
+  private var _mapImagerySource: MapImagerySource = .google
+
+  func mapImagerySource() -> MapImagerySource {
+    queue.sync { _mapImagerySource }
+  }
+
+  func setMapImagerySource(_ source: MapImagerySource) {
+    queue.async(flags: .barrier) { self._mapImagerySource = source }
+  }
+
+  func mapStatus() -> String {
+    queue.sync { _mapStatus }
+  }
+
+  func setMapStatus(_ status: String) {
+    queue.async(flags: .barrier) { self._mapStatus = status }
+  }
+
+  private var _mapRelocateRequest: MapCoordinate?
+  private var _mapRelocateGeneration: Int = 0
+  private var _mapCurrentCoordinate: MapCoordinate?
+
+  func mapRelocateRequest() -> MapCoordinate? {
+    queue.sync { _mapRelocateRequest }
+  }
+
+  func setMapRelocateRequest(_ coordinate: MapCoordinate?) {
+    queue.async(flags: .barrier) {
+      self._mapRelocateRequest = coordinate
+      if coordinate != nil { self._mapRelocateGeneration += 1 }
+    }
+  }
+
+  func mapRelocateGeneration() -> Int {
+    queue.sync { _mapRelocateGeneration }
+  }
+
+  func mapCurrentCoordinate() -> MapCoordinate? {
+    queue.sync { _mapCurrentCoordinate }
+  }
+
+  func setMapCurrentCoordinate(_ coordinate: MapCoordinate) {
+    queue.async(flags: .barrier) { self._mapCurrentCoordinate = coordinate }
+  }
 }
 
 @MainActor
@@ -796,6 +865,82 @@ final class PatternMenuModel {
 
   var infiniteZoomQuality: InfiniteZoomQuality = .balanced {
     didSet { coordinator.setInfiniteZoomQuality(infiniteZoomQuality) }
+  }
+
+  // ─── World map ───────────────────────────────────────────────────────────
+  var mapFlightTier: MapFlightTier = .cruise {
+    didSet { coordinator.setMapFlightTier(mapFlightTier) }
+  }
+  var mapDetailLevel: MapDetailLevel = .standard {
+    didSet { coordinator.setMapDetailLevel(mapDetailLevel) }
+  }
+  var mapImagerySource: MapImagerySource = .google {
+    didSet { coordinator.setMapImagerySource(mapImagerySource) }
+  }
+  /// Live readout published by the renderer (zoom, clearance, coordinates).
+  var mapStatus: String = ""
+  var mapCurrentCoordinate: MapCoordinate?
+  var mapBookmarks: [MapBookmark] = []
+  var mapLatitudeText: String = ""
+  var mapLongitudeText: String = ""
+
+  private static let mapBookmarksKey = "vr-dive.worldmap.bookmarks"
+
+  func refreshMapStatus() {
+    let status = coordinator.mapStatus()
+    if status != mapStatus { mapStatus = status }
+    if let coordinate = coordinator.mapCurrentCoordinate() {
+      mapCurrentCoordinate = coordinate
+    }
+  }
+
+  func relocateToCoordinate(_ coordinate: MapCoordinate) {
+    guard coordinate.isValid else { return }
+    coordinator.setMapRelocateRequest(coordinate)
+  }
+
+  func relocateFromTextFields() {
+    let latitude = Double(mapLatitudeText.trimmingCharacters(in: .whitespaces))
+    let longitude = Double(mapLongitudeText.trimmingCharacters(in: .whitespaces))
+    guard let latitude, let longitude else { return }
+    relocateToCoordinate(MapCoordinate(latitude: latitude, longitude: longitude))
+  }
+
+  func copyCurrentCoordinateToTextFields() {
+    guard let coordinate = mapCurrentCoordinate else { return }
+    mapLatitudeText = String(format: "%.5f", coordinate.latitude)
+    mapLongitudeText = String(format: "%.5f", coordinate.longitude)
+  }
+
+  func addCurrentBookmark() {
+    guard let coordinate = mapCurrentCoordinate else { return }
+    let name = String(format: "%.4f, %.4f", coordinate.latitude, coordinate.longitude)
+    mapBookmarks.append(
+      MapBookmark(name: name, latitude: coordinate.latitude, longitude: coordinate.longitude))
+    saveMapBookmarks()
+  }
+
+  func removeBookmark(_ bookmark: MapBookmark) {
+    mapBookmarks.removeAll { $0.id == bookmark.id }
+    saveMapBookmarks()
+  }
+
+  func goToBookmark(_ bookmark: MapBookmark) {
+    relocateToCoordinate(bookmark.coordinate)
+  }
+
+  private func saveMapBookmarks() {
+    if let data = try? JSONEncoder().encode(mapBookmarks) {
+      UserDefaults.standard.set(data, forKey: Self.mapBookmarksKey)
+    }
+  }
+
+  private func loadMapBookmarks() {
+    guard
+      let data = UserDefaults.standard.data(forKey: Self.mapBookmarksKey),
+      let bookmarks = try? JSONDecoder().decode([MapBookmark].self, from: data)
+    else { return }
+    mapBookmarks = bookmarks
   }
 
   // ─── DynamicBox ──────────────────────────────────────────────────────────
@@ -878,6 +1023,10 @@ final class PatternMenuModel {
     self.infiniteZoomRate = coordinator.infiniteZoomRate()
     self.infiniteZoomDirection = coordinator.infiniteZoomDirection()
     self.infiniteZoomQuality = coordinator.infiniteZoomQuality()
+    self.mapFlightTier = coordinator.mapFlightTier()
+    self.mapDetailLevel = coordinator.mapDetailLevel()
+    self.mapImagerySource = coordinator.mapImagerySource()
+    loadMapBookmarks()
   }
 
   func refreshFromCoordinator() {
@@ -890,6 +1039,9 @@ final class PatternMenuModel {
     infiniteZoomRate = coordinator.infiniteZoomRate()
     infiniteZoomDirection = coordinator.infiniteZoomDirection()
     infiniteZoomQuality = coordinator.infiniteZoomQuality()
+    mapFlightTier = coordinator.mapFlightTier()
+    mapDetailLevel = coordinator.mapDetailLevel()
+    mapImagerySource = coordinator.mapImagerySource()
   }
 
   func reset() {
@@ -955,4 +1107,109 @@ enum InfiniteZoomQuality: String, CaseIterable, Identifiable {
     case .detailed: return 0.00045
     }
   }
+}
+
+/// A geographic point used for relocation requests and bookmarks. Only the
+/// coordinate is stored; no map content is ever cached.
+nonisolated struct MapCoordinate: Equatable {
+  var latitude: Double
+  var longitude: Double
+
+  var isValid: Bool {
+    latitude >= -85.0 && latitude <= 85.0 && longitude >= -180.0 && longitude <= 180.0
+  }
+}
+
+struct MapBookmark: Codable, Identifiable, Equatable {
+  var id: UUID = UUID()
+  var name: String
+  var latitude: Double
+  var longitude: Double
+
+  var coordinate: MapCoordinate {
+    MapCoordinate(latitude: latitude, longitude: longitude)
+  }
+}
+
+/// Flight-speed presets for the streaming world map.
+/// movement is scaled by `speedScale`, so 50x is a slow walk over a city and
+/// 20000x crosses continents in seconds.
+enum MapFlightTier: String, CaseIterable, Identifiable {
+  case stroll
+  case cruise
+  case fast
+  case continental
+
+  var id: String { rawValue }
+
+  var displayName: String {
+    switch self {
+    case .stroll: return "慢速 50×"
+    case .cruise: return "巡航 250×"
+    case .fast: return "高速 2000×"
+    case .continental: return "洲际 20000×"
+    }
+  }
+
+  var speedScale: Float {
+    switch self {
+    case .stroll: return 50
+    case .cruise: return 250
+    case .fast: return 2_000
+    case .continental: return 20_000
+    }
+  }
+
+  func next() -> MapFlightTier {
+    let all = Self.allCases
+    guard let index = all.firstIndex(of: self) else { return self }
+    return all[(index + 1) % all.count]
+  }
+}
+
+/// How much of the map centre gets the extra-resolution satellite composite.
+/// Larger radii look sharper directly beneath the camera at the cost of more
+/// tile requests and VRAM.
+enum MapDetailLevel: String, CaseIterable, Identifiable {
+  case performance
+  case standard
+  case high
+
+  var id: String { rawValue }
+
+  var displayName: String {
+    switch self {
+    case .performance: return "标准贴图"
+    case .standard: return "中心高清"
+    case .high: return "加宽高清"
+    }
+  }
+
+  /// Radius in tiles around the camera that fetch imagery one zoom finer.
+  var imageryBiasRadius: Int {
+    switch self {
+    case .performance: return 0
+    case .standard: return 1
+    case .high: return 2
+    }
+  }
+}
+
+/// Which imagery to drape over the DEM. `none` still renders the full open
+/// terrain with procedural colouring, which is useful where Google content is
+/// unavailable or must be avoided.
+enum MapImagerySource: String, CaseIterable, Identifiable {
+  case google
+  case none
+
+  var id: String { rawValue }
+
+  var displayName: String {
+    switch self {
+    case .google: return "Google 卫星"
+    case .none: return "仅地形"
+    }
+  }
+
+  var providesImagery: Bool { self == .google }
 }
