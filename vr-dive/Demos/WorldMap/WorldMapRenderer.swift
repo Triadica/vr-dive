@@ -15,6 +15,12 @@ nonisolated struct WorldMapUniforms {
   var navigationInverse: simd_float4x4
 }
 
+nonisolated struct WorldMapCityLabelVertex {
+  var anchor: SIMD4<Float>
+  /// x/y are clip-space offsets; z/w are texture u/v.
+  var cornerUV: SIMD4<Float>
+}
+
 /// Streaming satellite/terrain map. Unlike the one-off Gyirong reconstruction,
 /// this renderer keeps a quadtree of real Web Mercator tiles around the camera
 /// and swaps them as it moves, so the player can roam the whole world.
@@ -35,26 +41,12 @@ final class WorldMapRenderer: VisualPatternController {
 
   private static let skirtDepth: Float = 45
   private static let maximumConcurrentLoads = 6
-  private static let maximumPendingLoads = 400
-  private static let maximumLeaves = 140
   private static let gridUpdateInterval: Float = 0.22
   private static let tileRetainSeconds: Float = 3.0
+  private static let rootZoom = 8
 
-  // Quadtree LOD: root spans z8; leaves refine toward z15 near the camera.
-  private static let minimumZoom = 8
-  private static let maximumZoom = 15
-  private static let quadtreeLevels = 7
-  private static let rootZoom = maximumZoom - quadtreeLevels
-  private static let maxViewDistance: Float = 90_000
-  private static let splitDistanceFactor: Float = 1.1
-  /// A tile is only refined while it is at least this multiple of the camera's
-  /// altitude in size, so flying high does not waste detail right beneath you.
-  private static let minimumVisibleSpanFactor: Float = 1.0
-
-  private static let highDetailZoomThreshold = 14
-  private static let gpuBudgetBytes = 256 * 1024 * 1024
   private static let minimumClearance: Float = 30
-  private static let maximumClearance: Float = 20_000
+  private static let maximumClearance: Float = 2_000_000
   private static let clearanceResponse: Float = 10
 
   private static let startLatitude = 28.281_051
@@ -65,9 +57,23 @@ final class WorldMapRenderer: VisualPatternController {
   private struct PendingLoad {
     let id: MapTileID
     let imageryZoomBias: Int
-    let imageryEnabled: Bool
     let generation: Int
-    let requestedAt: Float
+    let reference: MapSceneReference
+    // nil means terrain; otherwise this is a texture-only replacement.
+    let baseTile: WorldMapTile?
+    let cancellation = MapLoadCancellation()
+
+    var reservedBytes: Int {
+      baseTile == nil
+        ? MapStreamingPolicy.meshBytes(zoom: id.z)
+        : MapStreamingPolicy.textureBytes(bias: imageryZoomBias)
+    }
+  }
+
+  private struct CompletedLoad {
+    let request: PendingLoad
+    let tile: WorldMapTile?
+    let completedAt: TimeInterval
   }
 
   private let device: MTLDevice
@@ -80,6 +86,15 @@ final class WorldMapRenderer: VisualPatternController {
   private let skyVertexBuffer: MTLBuffer
   private let skyIndexBuffer: MTLBuffer
   private let skyIndexCount: Int
+  private let compassPipeline: MTLRenderPipelineState
+  private let compassDepthState: MTLDepthStencilState
+  private let compassVertexBuffer: MTLBuffer
+  private let compassTexture: MTLTexture
+  private let cityLabelPipeline: MTLRenderPipelineState
+  private let cityLabelDepthState: MTLDepthStencilState
+  private let cityLabelTexture: MTLTexture
+  private var cityLabelVertexBuffer: MTLBuffer
+  private var cityLabelVertexCount: Int
   private let placeholderTexture: MTLTexture
   private let mipmapQueue: MTLCommandQueue
   private let overlayPipeline: MTLRenderPipelineState
@@ -90,13 +105,15 @@ final class WorldMapRenderer: VisualPatternController {
   private let loadQueue: OperationQueue
   private let lock = NSLock()
   private var tiles: [MapTileID: WorldMapTile] = [:]
-  private var readyTiles: [WorldMapTile] = []
+  private var readyTiles: [CompletedLoad] = []
   private var pendingLoads: [PendingLoad] = []
-  private var inFlight: Set<MapTileID> = []
-  private var retryCounts: [MapTileID: Int] = [:]
-  private var retryAfter: [MapTileID: Float] = [:]
+  private var inFlight: [MapTileID: PendingLoad] = [:]
+  private var retries: [MapTileID: MapRetryState] = [:]
+  private var wantedTiles: Set<MapTileID> = []
   private var tileLastUsed: [MapTileID: Float] = [:]
   private var currentLeaves: Set<MapTileID> = []
+  private var displayedTiles: Set<MapTileID> = []
+  private var activeRootZoom = 8
   private var gridGeneration = 0
   private var lastGridUpdateTime: Float = -1_000
   private var lastGridCamera: SIMD3<Float>?
@@ -112,10 +129,12 @@ final class WorldMapRenderer: VisualPatternController {
   private var lastFrameTime: Float = -1
   private var didLogConfiguration = false
   private var navigationSpeedScale: Float = 250
+  private var navigationState = MapNavigationState()
+  private var lastGridClearance: Float = -1
   private var mapFlightTier: MapFlightTier = .cruise
   private var lastStatusTime: Float = -1
   private var lastRelocateGeneration: Int = -1
-  private var lastGroundAltitude: Float = 0
+  private var lastGroundAltitude: Float = WorldMapRenderer.startAltitude
   private var lastGroundZoom: Int = 0
   private var residentBytes: Int = 0
 
@@ -147,6 +166,20 @@ final class WorldMapRenderer: VisualPatternController {
     skyVertexBuffer = sky.vertexBuffer
     skyIndexBuffer = sky.indexBuffer
     skyIndexCount = sky.indexCount
+    compassPipeline = try Self.makeCompassPipeline(
+      device: device,
+      library: library,
+      maxViewCount: maxViewCount)
+    compassDepthState = Self.makeCompassDepthState(device: device)
+    compassVertexBuffer = try Self.makeCompassVertexBuffer(device: device)
+    compassTexture = try Self.makeCompassTexture(device: device)
+    cityLabelPipeline = try Self.makeCityLabelPipeline(
+      device: device, library: library, maxViewCount: maxViewCount)
+    cityLabelDepthState = Self.makeCompassDepthState(device: device)
+    cityLabelTexture = try Self.makeCityLabelTexture(device: device)
+    let cityLabels = try Self.makeCityLabelVertexBuffer(device: device, reference: reference)
+    cityLabelVertexBuffer = cityLabels.buffer
+    cityLabelVertexCount = cityLabels.count
     placeholderTexture = try Self.makePlaceholderTexture(device: device)
     guard let mipmapQueue = device.makeCommandQueue() else {
       throw WorldMapError.resourceAllocationFailed("command queue")
@@ -169,18 +202,33 @@ final class WorldMapRenderer: VisualPatternController {
     loadQueue = queue
 
     print(
-      "[WorldMap] Streaming quadtree map ready: start=(\(Self.startLatitude),\(Self.startLongitude)), zoom=z\(Self.rootZoom)...z\(Self.maximumZoom), imagery=\(google.isAvailable ? "Google satellite" : "unavailable (no key)"), terrain=\(OpenDEMTileClient.attribution), imageryAttribution=\(GoogleMapsTileClient.attribution)"
+      "[WorldMap] Streaming quadtree map ready: start=(\(Self.startLatitude),\(Self.startLongitude)), zoom=z0...z\(MapStreamingPolicy.maximumZoom), imagery=\(google.isAvailable ? "Google satellite" : "unavailable (no key)"), terrain=\(OpenDEMTileClient.attribution), imageryAttribution=\(GoogleMapsTileClient.attribution)"
     )
+  }
+
+  deinit {
+    for request in inFlight.values { request.cancellation.cancel() }
   }
 
   func synchronizeState(_ context: PatternSimulationContext) {
     mapFlightTier = context.mapFlightTier
     navigationSpeedScale = context.mapFlightTier.speedScale
-    highDetailRadius = context.mapDetailLevel.imageryBiasRadius
+    let radius = context.mapDetailLevel.imageryBiasRadius
+    if highDetailRadius != radius {
+      highDetailRadius = radius
+      for request in inFlight.values where request.baseTile != nil { request.cancellation.cancel() }
+      retries.removeAll()
+      lastGridUpdateTime = -1_000
+    }
     let imageryEnabledNow = context.mapImagerySource.providesImagery
     if imageryEnabledNow != imageryEnabled {
       imageryEnabled = imageryEnabledNow
-      clearTileCache()
+      for request in inFlight.values where request.baseTile != nil { request.cancellation.cancel() }
+      for (id, tile) in tiles where !imageryEnabled {
+        tiles[id] = tile.replacingTexture(nil, bias: 0)
+      }
+      retries.removeAll()
+      lastGridUpdateTime = -1_000
       didLogConfiguration = false
       print("[WorldMap] Imagery source -> \(context.mapImagerySource.displayName)")
     }
@@ -192,77 +240,53 @@ final class WorldMapRenderer: VisualPatternController {
     }
   }
 
-  /// Drops every loaded tile and invalidates in-flight builds.
+  /// Only the render thread owns tiles and scheduling. Workers publish completions
+  /// through the lock, and cancelled requests retain their slot until they finish.
   private func clearTileCache() {
     lock.lock()
     gridGeneration += 1
-    tiles.removeAll()
-    readyTiles.removeAll()
-    pendingLoads.removeAll()
-    retryCounts.removeAll()
-    retryAfter.removeAll()
-    tileLastUsed.removeAll()
-    currentLeaves.removeAll()
-    lastGridUpdateTime = -1_000
-    lastGridCamera = nil
-    lastSolveRequestTime = -1_000
     solvedLeaves = nil
     lock.unlock()
+    for request in inFlight.values { request.cancellation.cancel() }
+    pendingLoads.removeAll()
+    tiles.removeAll()
+    retries.removeAll()
+    tileLastUsed.removeAll()
+    wantedTiles.removeAll()
+    currentLeaves.removeAll()
+    displayedTiles.removeAll()
+    activeRootZoom = Self.rootZoom
+    residentBytes = 0
+    lastGridUpdateTime = -1_000
+    lastGridCamera = nil
+    lastGridClearance = -1
+    lastSolveRequestTime = -1_000
   }
 
   func updateSimulation(_ context: PatternSimulationContext) {}
 
   func resetToInitialState() {
-    lock.lock()
-    gridGeneration += 1
-    tiles.removeAll()
-    readyTiles.removeAll()
-    pendingLoads.removeAll()
-    retryCounts.removeAll()
-    retryAfter.removeAll()
-    tileLastUsed.removeAll()
-    currentLeaves.removeAll()
+    clearTileCache()
+    navigationState = MapNavigationState()
     verticalOffset = -(Self.startGroundEstimate + Self.startAltitude)
     desiredClearance = Self.startAltitude
+    lastGroundAltitude = Self.startAltitude
+    lastGroundZoom = 0
     hasClearanceBaseline = false
     lastFrameTime = -1
-    lastGridUpdateTime = -1_000
-    lastGridCamera = nil
-    lastSolveRequestTime = -1_000
-    solvedLeaves = nil
-    lock.unlock()
-    print("[WorldMap] Map tiles reset.")
+    didLogConfiguration = false
   }
 
-  /// Re-anchors the local frame to a new coordinate. All tiles are rebuilt
-  /// against the new origin; the caller is responsible for resetting the
-  /// navigation transform so the camera snaps back to the new start point.
   private func relocate(to coordinate: MapCoordinate) {
     reference = MapSceneReference(
-      latitude: coordinate.latitude,
-      longitude: coordinate.longitude,
+      latitude: coordinate.latitude, longitude: coordinate.longitude,
       geometryZoom: Self.rootZoom)
-    lock.lock()
-    gridGeneration += 1
-    tiles.removeAll()
-    readyTiles.removeAll()
-    pendingLoads.removeAll()
-    retryCounts.removeAll()
-    retryAfter.removeAll()
-    tileLastUsed.removeAll()
-    currentLeaves.removeAll()
-    verticalOffset = -(Self.startGroundEstimate + Self.startAltitude)
-    desiredClearance = Self.startAltitude
-    hasClearanceBaseline = false
-    lastFrameTime = -1
-    lastGridUpdateTime = -1_000
-    lastGridCamera = nil
-    lastSolveRequestTime = -1_000
-    solvedLeaves = nil
-    lock.unlock()
-    didLogConfiguration = false
-    print(
-      "[WorldMap] Relocated to \(coordinate.latitude), \(coordinate.longitude).")
+    if let labels = try? Self.makeCityLabelVertexBuffer(device: device, reference: reference) {
+      cityLabelVertexBuffer = labels.buffer
+      cityLabelVertexCount = labels.count
+    }
+    resetToInitialState()
+    print("[WorldMap] Relocated to \(coordinate.latitude), \(coordinate.longitude).")
   }
 
   func encodeFrame(encoder: MTLRenderCommandEncoder, context: PatternRenderContext) {
@@ -271,28 +295,30 @@ final class WorldMapRenderer: VisualPatternController {
     let navigationInverse = simd_inverse(navigation)
     let cameraScene = cameraScenePosition(context: context, navigation: navigation)
 
-    let deltaTime = lastFrameTime < 0
+    let deltaTime =
+      lastFrameTime < 0
       ? 0 : min(max(context.time - lastFrameTime, 0), 0.1)
     lastFrameTime = context.time
-    updateTerrainFollowing(cameraScene: cameraScene, deltaTime: deltaTime)
-
+    drainReadyTiles()
     if context.time - lastGridUpdateTime >= Self.gridUpdateInterval {
       lastGridUpdateTime = context.time
       let leaves = takeSolvedLeaves() ?? currentLeaves
       applyGrid(leaves: leaves, cameraScene: cameraScene, now: context.time)
     }
+    let coverage = makeCoverageSet()
+    displayedTiles = coverage
+    for id in coverage { tileLastUsed[id] = context.time }
+    updateTerrainFollowing(cameraScene: cameraScene, deltaTime: deltaTime, coverage: coverage)
     scheduleGridSolve(cameraScene: cameraScene, now: context.time)
-    drainReadyTiles()
+    pumpLoads()
     publishStatus(cameraScene: cameraScene, now: context.time)
 
-    // Camera forward in scene space, used to cull tiles behind the viewer.
-    let viewToWorld = context.viewData.viewToWorldTransforms.first ?? matrix_identity_float4x4
-    let worldForward = -SIMD3<Float>(
-      viewToWorld.columns.2.x, viewToWorld.columns.2.y, viewToWorld.columns.2.z)
-    let sceneForward4 = navigationInverse * SIMD4<Float>(worldForward, 0)
-    let sceneForward = SIMD3<Float>(sceneForward4.x, sceneForward4.y, sceneForward4.z)
-    let renderSet = makeRenderSet(cameraScene: cameraScene, sceneForward: sceneForward)
+    let clipFromScene = context.viewData.viewProjectionMatrices.map { $0 * navigationInverse }
+    let renderSet = makeRenderSet(
+      coverage: coverage, cameraScene: cameraScene, clipFromScene: clipFromScene)
 
+    let currentViewDistance = MapStreamingPolicy.viewDistance(
+      clearance: max(lastGroundAltitude, Self.minimumClearance))
     var uniforms = WorldMapUniforms(
       viewCount: UInt32(max(context.viewData.viewCount, 1)),
       pad0: 0,
@@ -300,7 +326,7 @@ final class WorldMapRenderer: VisualPatternController {
       pad1: 0,
       cameraScene: SIMD4<Float>(cameraScene, 1),
       fogParams: SIMD4<Float>(
-        Self.maxViewDistance * 0.5, Self.maxViewDistance * 0.98, 0, 0),
+        currentViewDistance * 0.72, currentViewDistance * 0.99, 0, 0),
       navigationInverse: navigationInverse)
     var viewProjectionMatrices = context.viewData.viewProjectionMatrices
     if viewProjectionMatrices.isEmpty {
@@ -322,6 +348,19 @@ final class WorldMapRenderer: VisualPatternController {
       indexType: .uint16,
       indexBuffer: skyIndexBuffer,
       indexBufferOffset: 0)
+    encoder.popDebugGroup()
+
+    encoder.pushDebugGroup("WorldMap compass")
+    encoder.setRenderPipelineState(compassPipeline)
+    encoder.setDepthStencilState(compassDepthState)
+    encoder.setCullMode(.none)
+    encoder.setVertexBuffer(compassVertexBuffer, offset: 0, index: 0)
+    setVertexSharedData(
+      encoder: encoder,
+      uniforms: &uniforms,
+      viewProjectionMatrices: viewProjectionMatrices)
+    encoder.setFragmentTexture(compassTexture, index: 0)
+    encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
     encoder.popDebugGroup()
 
     encoder.pushDebugGroup("WorldMap terrain")
@@ -353,6 +392,19 @@ final class WorldMapRenderer: VisualPatternController {
     }
     encoder.popDebugGroup()
 
+    encoder.pushDebugGroup("WorldMap city labels")
+    encoder.setRenderPipelineState(cityLabelPipeline)
+    encoder.setDepthStencilState(cityLabelDepthState)
+    encoder.setCullMode(.none)
+    encoder.setVertexBuffer(cityLabelVertexBuffer, offset: 0, index: 0)
+    setVertexSharedData(
+      encoder: encoder,
+      uniforms: &uniforms,
+      viewProjectionMatrices: viewProjectionMatrices)
+    encoder.setFragmentTexture(cityLabelTexture, index: 0)
+    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: cityLabelVertexCount)
+    encoder.popDebugGroup()
+
     encoder.pushDebugGroup("WorldMap attribution")
     encoder.setRenderPipelineState(overlayPipeline)
     encoder.setDepthStencilState(overlayDepthState)
@@ -369,18 +421,15 @@ final class WorldMapRenderer: VisualPatternController {
     if !didLogConfiguration {
       didLogConfiguration = true
       print(
-        "[WorldMap] First frame: \(currentLeaves.count) leaves, \(drawn) tiles drawn. Navigate with □ to toggle pattern mode, sticks to fly, shoulders to boost.")
+        "[WorldMap] First frame: \(currentLeaves.count) leaves, \(drawn) tiles drawn. Navigate with □ to toggle pattern mode, sticks to fly, shoulders to boost."
+      )
     }
   }
 
   // MARK: - Navigation
 
   private func acceleratedNavigationTransform(_ transform: simd_float4x4) -> simd_float4x4 {
-    var result = transform
-    result.columns.3.x *= navigationSpeedScale
-    result.columns.3.y *= navigationSpeedScale
-    result.columns.3.z *= navigationSpeedScale
-    return result
+    navigationState.transform(transform, speed: navigationSpeedScale)
   }
 
   private func cameraScenePosition(
@@ -393,188 +442,18 @@ final class WorldMapRenderer: VisualPatternController {
       viewToWorld.columns.3.y,
       viewToWorld.columns.3.z,
       1)
-    let scene = simd_inverse(navigation) * cameraWorld
+    let scene = navigation * cameraWorld
     return SIMD3<Float>(scene.x, scene.y, scene.z)
   }
 
   // MARK: - Quadtree
 
-  private static func tileSpanMeters(zoom: Int, cosLatitude: Float) -> Float {
-    let circumference = Float(2.0 * Double.pi * MapProjection.earthRadius) * cosLatitude
-    return circumference / Float(1 << zoom)
-  }
-
-  /// Mesh density follows tile zoom. Deep leaves under the camera keep full
-  /// detail; coarse leaves far away use a handful of quads, cutting the total
-  /// vertex and triangle load by an order of magnitude. The stored height grid
-  /// used for terrain following shrinks accordingly.
-  private static func meshQuads(forZoom zoom: Int) -> Int {
-    switch zoom {
-    case 15: return 64
-    case 14: return 48
-    case 13: return 32
-    case 12: return 24
-    case 11: return 16
-    case 10: return 12
-    default: return 8
-    }
-  }
-
-  /// Recursively selects leaf tiles: split while the node is still large on
-  /// screen (relative to flight altitude) and close enough to the camera.
-  /// Pure and `nonisolated` so it can run on the background grid queue.
-  nonisolated private func collectLeaves(
-    cameraScene: SIMD3<Float>,
-    reference: MapSceneReference,
-    cosLatitude: Float
-  ) -> Set<MapTileID> {
-    var leaves = Set<MapTileID>()
-    let rootCenter = reference.tile(
-      atSceneX: cameraScene.x,
-      sceneZ: cameraScene.z,
-      zoom: Self.rootZoom)
-    let rootTileCount = Int(MapProjection.tileCount(zoom: Self.rootZoom))
-    for deltaY in -1...1 {
-      for deltaX in -1...1 {
-        let x = rootCenter.x + deltaX
-        let y = rootCenter.y + deltaY
-        guard x >= 0, y >= 0, x < rootTileCount, y < rootTileCount else { continue }
-        subdivide(
-          MapTileID(z: Self.rootZoom, x: x, y: y),
-          cameraScene: cameraScene,
-          altitude: cameraScene.y + Self.startAltitude,
-          reference: reference,
-          cosLatitude: cosLatitude,
-          into: &leaves)
-      }
-    }
-    enforceBalance(&leaves)
-    applyLeafBudget(&leaves, cameraScene: cameraScene, reference: reference)
-    return leaves
-  }
-
-  /// Hard ceiling on visible leaves. When the moving quadtree produces more,
-  /// the farthest sibling groups are merged into their parent until the count
-  /// is back under budget. This keeps the per-frame triangle load bounded on
-  /// weaker GPUs and during fast travel.
-  nonisolated private func applyLeafBudget(
-    _ leaves: inout Set<MapTileID>,
-    cameraScene: SIMD3<Float>,
-    reference: MapSceneReference
-  ) {
-    guard leaves.count > Self.maximumLeaves else { return }
-    var parentGroups: [MapTileID: Int] = [:]
-    for leaf in leaves where leaf.z > Self.rootZoom {
-      parentGroups[leaf.parent, default: 0] += 1
-    }
-    let candidates = parentGroups.compactMap {
-      (parent: MapTileID, count: Int) -> (parent: MapTileID, distance: Float)? in
-      guard count >= 2 else { return nil }
-      let center = MapProjection.tileCenterScenePosition(id: parent, reference: reference)
-      let distance = hypot(center.x - cameraScene.x, center.y - cameraScene.z)
-      return (parent, distance)
-    }.sorted { $0.distance > $1.distance }
-
-    for candidate in candidates {
-      guard leaves.count > Self.maximumLeaves else { break }
-      let removed = leaves.filter {
-        $0 == candidate.parent
-          || Self.isDescendant($0, of: candidate.parent, deeperThan: candidate.parent.z)
-      }
-      guard removed.count >= 2 else { continue }
-      for id in removed { leaves.remove(id) }
-      leaves.insert(candidate.parent)
-    }
-    enforceBalance(&leaves)
-  }
-
-  /// Splits leaves whose orthogonal neighbour is subdivided, so adjacent
-  /// leaves never differ by more than one zoom level. That keeps T-junctions to
-  /// a single step that the edge skirts can cover reliably.
-  nonisolated private func enforceBalance(_ leaves: inout Set<MapTileID>) {
-    var passes = 0
-    while passes < 8 {
-      passes += 1
-      var toSplit = Set<MapTileID>()
-      for leaf in leaves where leaf.z < Self.maximumZoom {
-        for neighbor in Self.edgeNeighbors(of: leaf) {
-          if leaves.contains(where: { Self.isDescendant($0, of: neighbor, deeperThan: leaf.z) }) {
-            toSplit.insert(leaf)
-            break
-          }
-        }
-      }
-      guard !toSplit.isEmpty else { break }
-      for leaf in toSplit {
-        leaves.remove(leaf)
-        for deltaY in 0...1 {
-          for deltaX in 0...1 {
-            leaves.insert(
-              MapTileID(z: leaf.z + 1, x: leaf.x * 2 + deltaX, y: leaf.y * 2 + deltaY))
-          }
-        }
-      }
-    }
-  }
-
-  private static func edgeNeighbors(of id: MapTileID) -> [MapTileID] {
-    [
-      MapTileID(z: id.z, x: id.x - 1, y: id.y),
-      MapTileID(z: id.z, x: id.x + 1, y: id.y),
-      MapTileID(z: id.z, x: id.x, y: id.y - 1),
-      MapTileID(z: id.z, x: id.x, y: id.y + 1),
-    ]
-  }
-
-  private static func isDescendant(
-    _ candidate: MapTileID,
-    of ancestor: MapTileID,
-    deeperThan zoom: Int
-  ) -> Bool {
-    guard candidate.z > zoom, candidate.z > ancestor.z else { return false }
-    let shift = candidate.z - ancestor.z
-    return (candidate.x >> shift) == ancestor.x && (candidate.y >> shift) == ancestor.y
-  }
-
-  nonisolated private func subdivide(
-    _ id: MapTileID,
-    cameraScene: SIMD3<Float>,
-    altitude: Float,
-    reference: MapSceneReference,
-    cosLatitude: Float,
-    into leaves: inout Set<MapTileID>
-  ) {
-    let center = MapProjection.tileCenterScenePosition(id: id, reference: reference)
-    let distance = hypot(center.x - cameraScene.x, center.y - cameraScene.z)
-    guard distance <= Self.maxViewDistance else { return }
-    let size = Self.tileSpanMeters(zoom: id.z, cosLatitude: cosLatitude)
-    let minimumSpan = max(80, altitude * Self.minimumVisibleSpanFactor)
-    if id.z < Self.maximumZoom,
-      distance < size * Self.splitDistanceFactor,
-      size > minimumSpan
-    {
-      for deltaY in 0...1 {
-        for deltaX in 0...1 {
-          subdivide(
-            MapTileID(z: id.z + 1, x: id.x * 2 + deltaX, y: id.y * 2 + deltaY),
-            cameraScene: cameraScene,
-            altitude: altitude,
-            reference: reference,
-            cosLatitude: cosLatitude,
-            into: &leaves)
-        }
-      }
-    } else {
-      leaves.insert(id)
-    }
-  }
-
   private func imageryBias(for leaf: MapTileID, cameraScene: SIMD3<Float>) -> Int {
-    guard imageryEnabled, highDetailRadius > 0, leaf.z >= Self.highDetailZoomThreshold else {
+    guard imageryEnabled, highDetailRadius > 0, leaf.z >= 14 else {
       return 0
     }
     let center = MapProjection.tileCenterScenePosition(id: leaf, reference: reference)
-    let size = Self.tileSpanMeters(zoom: leaf.z, cosLatitude: Float(reference.cosLatitude))
+    let size = MapStreamingPolicy.span(zoom: leaf.z, reference: reference)
     let distance = hypot(center.x - cameraScene.x, center.y - cameraScene.z)
     return distance <= size * Float(highDetailRadius) ? 1 : 0
   }
@@ -583,7 +462,10 @@ final class WorldMapRenderer: VisualPatternController {
   /// Only one solve runs at a time; a solve that outlives a reset is discarded
   /// via the generation check.
   private func scheduleGridSolve(cameraScene: SIMD3<Float>, now: Float) {
-    let moved = lastGridCamera.map { simd_distance($0, cameraScene) > 20 } ?? true
+    let clearance = max(lastGroundAltitude, Self.minimumClearance)
+    let moved =
+      (lastGridCamera.map { simd_distance($0, cameraScene) > 20 } ?? true)
+      || abs(clearance - lastGridClearance) > max(20, clearance * 0.05)
     guard moved, now - lastSolveRequestTime >= Self.gridUpdateInterval else { return }
     lock.lock()
     guard !isSolvingGrid else {
@@ -593,17 +475,15 @@ final class WorldMapRenderer: VisualPatternController {
     isSolvingGrid = true
     lastSolveRequestTime = now
     lastGridCamera = cameraScene
+    lastGridClearance = clearance
     let generation = gridGeneration
     let referenceSnapshot = reference
-    let cosLatitude = Float(reference.cosLatitude)
     lock.unlock()
 
     gridQueue.async { [weak self] in
       guard let self else { return }
-      let leaves = self.collectLeaves(
-        cameraScene: cameraScene,
-        reference: referenceSnapshot,
-        cosLatitude: cosLatitude)
+      let leaves = MapStreamingPolicy.select(
+        camera: cameraScene, clearance: clearance, reference: referenceSnapshot)
       self.lock.lock()
       if generation == self.gridGeneration {
         self.solvedLeaves = leaves
@@ -622,176 +502,157 @@ final class WorldMapRenderer: VisualPatternController {
   }
 
   private func applyGrid(
-    leaves: Set<MapTileID>,
-    cameraScene: SIMD3<Float>,
-    now: Float
+    leaves: Set<MapTileID>, cameraScene: SIMD3<Float>, now: Float
   ) {
-    lock.lock()
     currentLeaves = leaves
-    // Keep leaves plus every ancestor so a not-yet-loaded leaf can fall back to
-    // a coarser parent instead of showing a hole.
-    var wanted = Set<MapTileID>()
-    for leaf in leaves {
-      wanted.insert(leaf)
-      var node = leaf
-      while node.z > Self.rootZoom {
-        node = node.parent
-        wanted.insert(node)
+    activeRootZoom = leaves.map(\.z).min() ?? activeRootZoom
+    wantedTiles = MapStreamingPolicy.wanted(leaves: leaves, rootZoom: activeRootZoom)
+    // Keep finishing imagery for the coverage that was visible last frame,
+    // even when an altitude-driven root change makes it no longer part of the
+    // new quadtree. It remains the visual fallback until the replacement is ready.
+    let activeDemand = wantedTiles.union(displayedTiles)
+    let imageryAvailable = imageryEnabled && google.isAvailable
+    func bias(_ id: MapTileID) -> Int {
+      leaves.contains(id) ? imageryBias(for: id, cameraScene: cameraScene) : 0
+    }
+    for (id, request) in inFlight {
+      if !activeDemand.contains(id) || request.generation != gridGeneration
+        || (request.baseTile != nil
+          && (!imageryAvailable || request.imageryZoomBias < bias(id)))
+      {
+        request.cancellation.cancel()
       }
     }
-    for id in wanted { tileLastUsed[id] = now }
-
-    let readyIDs = Set(readyTiles.map { $0.id })
-    let pendingIDs = Set(pendingLoads.map { $0.id })
-    // Queue every wanted tile, not just the leaves, so the coarse ancestors
-    // load first and cover the view immediately; the detail leaves stream in
-    // afterwards.
-    for tile in wanted {
-      guard tiles[tile] == nil, !inFlight.contains(tile), !readyIDs.contains(tile),
-        !pendingIDs.contains(tile), (retryCounts[tile] ?? 0) < 3,
-        (retryAfter[tile] ?? -.greatestFiniteMagnitude) <= now
-      else { continue }
-      pendingLoads.append(
-        PendingLoad(
-          id: tile,
-          imageryZoomBias: imageryBias(for: tile, cameraScene: cameraScene),
-          imageryEnabled: imageryEnabled,
-          generation: gridGeneration,
-          requestedAt: now))
-    }
-    // Coarse zoom first gives progressive coverage; when over the queue budget
-    // drop the finest (least critical) work.
-    pendingLoads.sort { $0.id.z < $1.id.z }
-    if pendingLoads.count > Self.maximumPendingLoads {
-      pendingLoads.removeLast(pendingLoads.count - Self.maximumPendingLoads)
-    }
-
-    let expired = tiles.keys.filter { id in
-      guard !wanted.contains(id) else { return false }
-      let last = tileLastUsed[id] ?? -.greatestFiniteMagnitude
-      return now - last > Self.tileRetainSeconds
+    for id in activeDemand { tileLastUsed[id] = now }
+    retries = retries.filter { activeDemand.contains($0.key) }
+    let expired = tiles.keys.filter {
+      !wantedTiles.contains($0)
+        && now - (tileLastUsed[$0] ?? -.greatestFiniteMagnitude) > Self.tileRetainSeconds
     }
     for id in expired {
       tiles[id] = nil
       tileLastUsed[id] = nil
-      retryCounts[id] = nil
-      retryAfter[id] = nil
     }
 
-    // Keep resident GPU memory under budget by evicting the least-recently-used
-    // tiles that are no longer part of the current quadtree.
-    var resident = tiles.values.reduce(0) { $0 + $1.gpuBytes }
-    if resident > Self.gpuBudgetBytes {
-      let evictable = tiles.keys
-        .filter { !wanted.contains($0) }
-        .sorted { (tileLastUsed[$0] ?? 0) < (tileLastUsed[$1] ?? 0) }
-      for id in evictable {
-        guard resident > Self.gpuBudgetBytes, let tile = tiles[id] else { break }
-        resident -= tile.gpuBytes
-        tiles[id] = nil
-        tileLastUsed[id] = nil
-        retryCounts[id] = nil
-        retryAfter[id] = nil
-      }
+    // Rebuild the small pending list from current demand; obsolete work never
+    // remains ahead of the new camera position. In-flight requests have snapshots.
+    pendingLoads.removeAll()
+    let uptime = ProcessInfo.processInfo.systemUptime
+    for id in activeDemand {
+      guard inFlight[id] == nil, (retries[id]?.nextAttempt ?? 0) <= uptime else { continue }
+      let tile = tiles[id]
+      let targetBias = bias(id)
+      guard
+        tile == nil
+          || (imageryAvailable
+            && (tile?.texture == nil || (tile?.imageryZoomBias ?? 0) < targetBias))
+      else { continue }
+      pendingLoads.append(
+        PendingLoad(
+          id: id, imageryZoomBias: targetBias, generation: gridGeneration,
+          reference: reference, baseTile: tile))
     }
-    residentBytes = resident
-    lock.unlock()
-
-    pumpLoads()
+    pendingLoads.sort {
+      // Establish coarse levels first. At the same level, finish imagery before
+      // starting more terrain so a visible green fallback is short-lived.
+      if $0.id.z != $1.id.z { return $0.id.z < $1.id.z }
+      if ($0.baseTile == nil) != ($1.baseTile == nil) { return $0.baseTile != nil }
+      let a = MapStreamingPolicy.distance(to: $0.id, camera: cameraScene, reference: reference)
+      let b = MapStreamingPolicy.distance(to: $1.id, camera: cameraScene, reference: reference)
+      return a == b ? MapStreamingPolicy.ordered($0.id, $1.id) : a < b
+    }
+    updateResidentBytes()
+    // The selected working set already fits. Evict retained old regions early
+    // enough to leave upload headroom for the incoming region.
+    for id in tiles.keys.filter({ !wantedTiles.contains($0) && !displayedTiles.contains($0) }).sorted(by: {
+      (tileLastUsed[$0] ?? 0) < (tileLastUsed[$1] ?? 0)
+    }) {
+      guard residentBytes > MapStreamingPolicy.workingSetBudget else { break }
+      tiles[id] = nil
+      tileLastUsed[id] = nil
+      updateResidentBytes()
+    }
   }
 
-  /// Draws each leaf if loaded, otherwise the nearest loaded ancestor, so there
-  /// is never both a parent and its child covering the same ground. Leaves
-  /// whose footprint is entirely behind the camera are skipped.
+  /// Select coverage before culling, so a missing child cannot introduce an
+  /// overlapping parent. Test each resulting tile against both eye frusta.
+  private func makeCoverageSet() -> Set<MapTileID> {
+    let imageryRequired = imageryEnabled && google.isAvailable
+    return MapStreamingPolicy.presentationCoverage(
+      leaves: currentLeaves,
+      imageryRequired: imageryRequired,
+      isLoaded: { self.tiles[$0] != nil },
+      hasImagery: { self.tiles[$0]?.texture != nil })
+  }
+
   private func makeRenderSet(
-    cameraScene: SIMD3<Float>,
-    sceneForward: SIMD3<Float>
-  ) -> [MapTileID] {
-    lock.lock()
-    let leaves = currentLeaves
-    let loadedIDs = Set(tiles.keys)
-    lock.unlock()
-    let forwardXZ = SIMD2<Float>(sceneForward.x, sceneForward.z)
-    let forwardLength = simd_length(forwardXZ)
-    let cullEnabled = forwardLength > 0.15
-    let forwardDirection = cullEnabled ? forwardXZ / forwardLength : SIMD2<Float>.zero
-    let cosLatitude = Float(reference.cosLatitude)
-    var renderSet = Set<MapTileID>()
-    for leaf in leaves {
-      if cullEnabled {
-        let center = MapProjection.tileCenterScenePosition(id: leaf, reference: reference)
-        let radius = Self.tileSpanMeters(zoom: leaf.z, cosLatitude: cosLatitude) * 0.75
-        let delta = SIMD2<Float>(center.x - cameraScene.x, center.y - cameraScene.z)
-        if simd_dot(delta, forwardDirection) < -radius { continue }
-      }
-      var node = leaf
-      while true {
-        if loadedIDs.contains(node) {
-          renderSet.insert(node)
-          break
-        }
-        guard node.z > Self.rootZoom else { break }
-        node = node.parent
-      }
-    }
-    // A coarse fallback tile covers its whole subtree, so drop any loaded
-    // descendant that happens to be in the set to avoid double-drawing.
-    for id in Array(renderSet) {
-      var ancestor = id.parent
-      while ancestor.z >= Self.rootZoom {
-        if renderSet.contains(ancestor) {
-          renderSet.remove(id)
-          break
-        }
-        ancestor = ancestor.parent
-      }
-    }
-    return Array(renderSet)
+    coverage: Set<MapTileID>, cameraScene: SIMD3<Float>,
+    clipFromScene: [simd_float4x4]
+  )
+    -> [MapTileID]
+  {
+    coverage.filter { id in
+      guard let tile = tiles[id] else { return false }
+      let flatCenter = SIMD3<Float>(
+        (tile.minSceneX + tile.maxSceneX) * 0.5,
+        (tile.minElevation + tile.maxElevation) * 0.5 + verticalOffset,
+        (tile.minSceneZ + tile.maxSceneZ) * 0.5)
+      let curvedCenter = MapGlobeProjection.curvedPosition(flatCenter, camera: cameraScene)
+      let halfWidth = (tile.maxSceneX - tile.minSceneX) * 0.5
+      let halfDepth = (tile.maxSceneZ - tile.minSceneZ) * 0.5
+      let halfHeight = (tile.maxElevation - tile.minElevation) * 0.5
+      // The tangent-sphere map is non-expanding. A sphere around the original
+      // tile bounds is therefore conservative after curvature is applied.
+      let radius = simd_length(SIMD3<Float>(halfWidth, halfHeight, halfDepth)) + 1_000
+      return MapFrustum.isVisible(
+        minimum: curvedCenter - SIMD3<Float>(repeating: radius),
+        maximum: curvedCenter + SIMD3<Float>(repeating: radius),
+        clipFromScene: clipFromScene)
+    }.sorted(by: MapStreamingPolicy.ordered)
+  }
+
+  private func updateResidentBytes() {
+    residentBytes = tiles.values.reduce(0) { $0 + $1.gpuBytes }
   }
 
   private func pumpLoads() {
-    while true {
-      lock.lock()
-      guard inFlight.count < Self.maximumConcurrentLoads, !pendingLoads.isEmpty else {
-        lock.unlock()
+    var reserved = inFlight.values.reduce(0) { total, request in
+      // Cancelled replacements can still retain an evicted mesh/texture until
+      // their worker finishes. Include that ownership in admission accounting.
+      let retainedBase = request.baseTile.map { tiles[$0.id] === $0 ? 0 : $0.gpuBytes } ?? 0
+      return total + request.reservedBytes + retainedBase
+    }
+    while inFlight.count < Self.maximumConcurrentLoads, !pendingLoads.isEmpty {
+      let next = pendingLoads[0]
+      guard residentBytes + reserved + next.reservedBytes <= MapStreamingPolicy.gpuBudget else {
         return
       }
-      let next = pendingLoads.removeFirst()
-      inFlight.insert(next.id)
-      lock.unlock()
-
+      pendingLoads.removeFirst()
+      inFlight[next.id] = next
+      reserved += next.reservedBytes
+      let device = device
+      let queue = mipmapQueue
+      let google = google
       loadQueue.addOperation { [weak self] in
-        guard let self else { return }
-        let tile = WorldMapTileBuilder.build(
-          device: self.device,
-          id: next.id,
-          reference: self.reference,
-          meshQuads: Self.meshQuads(forZoom: next.id.z),
-          imageryZoomBias: next.imageryZoomBias,
-          imageryEnabled: next.imageryEnabled,
-          skirtDepth: Self.skirtDepth,
-          commandQueue: self.mipmapQueue,
-          google: self.google)
-        self.lock.lock()
-        let isCurrent = next.generation == self.gridGeneration
-        if let tile, isCurrent {
-          self.readyTiles.append(tile)
-          self.retryCounts[next.id] = nil
-          self.retryAfter[next.id] = nil
-        } else if !isCurrent {
-          // Reset happened underneath this build; drop it silently.
+        let tile: WorldMapTile?
+        if let base = next.baseTile {
+          let texture = WorldMapTileBuilder.buildSatelliteTexture(
+            device: device, id: next.id, imageryZoomBias: next.imageryZoomBias,
+            commandQueue: queue, google: google,
+            isCancelled: { next.cancellation.isCancelled })
+          tile = texture.map { base.replacingTexture($0, bias: next.imageryZoomBias) }
         } else {
-          let attempts = self.retryCounts[next.id, default: 0] + 1
-          self.retryCounts[next.id] = attempts
-          if attempts <= 3 {
-            // Exponential backoff keeps a flaky connection from being hammered.
-            let backoff = min(powf(2, Float(attempts)), 30)
-            self.retryAfter[next.id] = next.requestedAt + backoff
-          }
+          tile = WorldMapTileBuilder.build(
+            device: device, id: next.id, reference: next.reference,
+            meshQuads: MapStreamingPolicy.meshQuads(zoom: next.id.z), skirtDepth: Self.skirtDepth,
+            isCancelled: { next.cancellation.isCancelled })
         }
-        self.inFlight.remove(next.id)
+        guard let self else { return }
+        self.lock.lock()
+        self.readyTiles.append(
+          CompletedLoad(
+            request: next, tile: tile, completedAt: ProcessInfo.processInfo.systemUptime))
         self.lock.unlock()
-        self.pumpLoads()
       }
     }
   }
@@ -801,10 +662,22 @@ final class WorldMapRenderer: VisualPatternController {
     let ready = readyTiles
     readyTiles.removeAll()
     lock.unlock()
-    guard !ready.isEmpty else { return }
-    for tile in ready {
-      tiles[tile.id] = tile
+    for result in ready {
+      let request = result.request
+      inFlight[request.id] = nil
+      guard request.generation == gridGeneration, !request.cancellation.isCancelled,
+        wantedTiles.contains(request.id) || displayedTiles.contains(request.id)
+      else { continue }
+      if let tile = result.tile {
+        tiles[tile.id] = tile
+        retries[request.id] = nil
+      } else {
+        var retry = retries[request.id] ?? MapRetryState()
+        retry.failed(at: result.completedAt)
+        retries[request.id] = retry
+      }
     }
+    updateResidentBytes()
   }
 
   // MARK: - Terrain following
@@ -813,7 +686,9 @@ final class WorldMapRenderer: VisualPatternController {
   /// The vertical stick is folded into `desiredClearance` (so the player still
   /// climbs and descends), while the terrain offset follows ridges and valleys
   /// instead of letting the camera clip into a mountain.
-  private func updateTerrainFollowing(cameraScene: SIMD3<Float>, deltaTime: Float) {
+  private func updateTerrainFollowing(
+    cameraScene: SIMD3<Float>, deltaTime: Float, coverage: Set<MapTileID>
+  ) {
     if !hasClearanceBaseline {
       clearanceBaselineY = cameraScene.y
       hasClearanceBaseline = true
@@ -825,10 +700,12 @@ final class WorldMapRenderer: VisualPatternController {
         max(desiredClearance + deltaY, Self.minimumClearance),
         Self.maximumClearance)
     }
-    guard let ground = terrainSample(atSceneX: cameraScene.x, sceneZ: cameraScene.z) else {
+    guard
+      let ground = terrainSample(atSceneX: cameraScene.x, sceneZ: cameraScene.z, coverage: coverage)
+    else {
+      lastGroundAltitude = desiredClearance
       return
     }
-    lastGroundAltitude = cameraScene.y - ground.height
     lastGroundZoom = ground.zoom
     let targetOffset = cameraScene.y - ground.height - desiredClearance
     let difference = targetOffset - verticalOffset
@@ -841,11 +718,17 @@ final class WorldMapRenderer: VisualPatternController {
     } else {
       verticalOffset += difference * min(1, deltaTime * Self.clearanceResponse)
     }
+    lastGroundAltitude = cameraScene.y - (ground.height + verticalOffset)
   }
 
-  private func terrainSample(atSceneX x: Float, sceneZ z: Float) -> (height: Float, zoom: Int)? {
+  private func terrainSample(
+    atSceneX x: Float, sceneZ z: Float, coverage: Set<MapTileID>
+  ) -> (height: Float, zoom: Int)? {
     var best: WorldMapTile?
-    for tile in tiles.values where tile.contains(sceneX: x, sceneZ: z) {
+    // Sample the same non-overlapping coverage that is drawn, not an invisible
+    // fine mesh still waiting for its siblings to replace a coarse fallback.
+    for id in coverage {
+      guard let tile = tiles[id], tile.contains(sceneX: x, sceneZ: z) else { continue }
       if best == nil || tile.id.z > best!.id.z {
         best = tile
       }
@@ -891,6 +774,337 @@ final class WorldMapRenderer: VisualPatternController {
   }
 
   // MARK: - Resource construction
+
+  private static func makeCityLabelVertexBuffer(
+    device: MTLDevice, reference: MapSceneReference
+  ) throws -> (buffer: MTLBuffer, count: Int) {
+    let columns = 4
+    let atlasWidth: Float = 2_048
+    let atlasHeight = Float(((MapCityCatalog.labels.count + columns - 1) / columns) * 128)
+    let halfHeight: Float = 0.018
+    let halfWidth: Float = 0.072
+    var vertices: [WorldMapCityLabelVertex] = []
+    vertices.reserveCapacity(MapCityCatalog.labels.count * 6)
+
+    for (index, city) in MapCityCatalog.labels.enumerated() {
+      let scene = reference.scenePosition(latitude: city.latitude, longitude: city.longitude)
+      let anchor = SIMD4<Float>(scene.x, 8_000, scene.y, 1)
+      let column = index % columns
+      let row = index / columns
+      let u0 = Float(column * 512) / atlasWidth
+      let u1 = Float((column + 1) * 512) / atlasWidth
+      let v0 = Float(row * 128) / atlasHeight
+      let v1 = Float((row + 1) * 128) / atlasHeight
+      func vertex(_ x: Float, _ y: Float, _ u: Float, _ v: Float) -> WorldMapCityLabelVertex {
+        WorldMapCityLabelVertex(anchor: anchor, cornerUV: SIMD4<Float>(x, y, u, v))
+      }
+      vertices.append(contentsOf: [
+        vertex(-halfWidth, -halfHeight, u0, v1),
+        vertex(halfWidth, -halfHeight, u1, v1),
+        vertex(-halfWidth, halfHeight, u0, v0),
+        vertex(-halfWidth, halfHeight, u0, v0),
+        vertex(halfWidth, -halfHeight, u1, v1),
+        vertex(halfWidth, halfHeight, u1, v0),
+      ])
+    }
+    guard
+      let buffer = device.makeBuffer(
+        bytes: vertices,
+        length: vertices.count * MemoryLayout<WorldMapCityLabelVertex>.stride,
+        options: .storageModeShared)
+    else { throw WorldMapError.resourceAllocationFailed("city label vertices") }
+    buffer.label = "WorldMap city label vertices"
+    return (buffer, vertices.count)
+  }
+
+  private static func makeCityLabelTexture(device: MTLDevice) throws -> MTLTexture {
+    let columns = 4
+    let cellWidth = 512
+    let cellHeight = 128
+    let width = columns * cellWidth
+    let rows = (MapCityCatalog.labels.count + columns - 1) / columns
+    let height = rows * cellHeight
+    var pixels = [UInt8](repeating: 0, count: width * height * 4)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+    let drew = pixels.withUnsafeMutableBytes { bytes -> Bool in
+      guard
+        let context = CGContext(
+          data: bytes.baseAddress,
+          width: width,
+          height: height,
+          bitsPerComponent: 8,
+          bytesPerRow: width * 4,
+          space: colorSpace,
+          bitmapInfo: bitmapInfo)
+      else { return false }
+
+      for (index, city) in MapCityCatalog.labels.enumerated() {
+        let column = index % columns
+        let row = index / columns
+        let cell = CGRect(
+          x: CGFloat(column * cellWidth),
+          y: CGFloat(height - (row + 1) * cellHeight),
+          width: CGFloat(cellWidth),
+          height: CGFloat(cellHeight))
+        let pill = cell.insetBy(dx: 12, dy: 15)
+        context.addPath(
+          CGPath(
+            roundedRect: pill,
+            cornerWidth: 28,
+            cornerHeight: 28,
+            transform: nil))
+        context.setFillColor(CGColor(red: 0.02, green: 0.05, blue: 0.10, alpha: 0.76))
+        context.fillPath()
+        context.setStrokeColor(CGColor(red: 0.82, green: 0.91, blue: 1, alpha: 0.82))
+        context.setLineWidth(4)
+        context.addPath(
+          CGPath(
+            roundedRect: pill,
+            cornerWidth: 28,
+            cornerHeight: 28,
+            transform: nil))
+        context.strokePath()
+
+        let fontSize: CGFloat = city.name.count > 11 ? 42 : 52
+        let font = CTFontCreateWithName("Helvetica-Bold" as CFString, fontSize, nil)
+        let attributes: [NSAttributedString.Key: Any] = [
+          NSAttributedString.Key(kCTFontAttributeName as String): font,
+          NSAttributedString.Key(kCTForegroundColorAttributeName as String):
+            CGColor(red: 1, green: 1, blue: 1, alpha: 0.98),
+          NSAttributedString.Key(kCTStrokeColorAttributeName as String):
+            CGColor(red: 0, green: 0, blue: 0, alpha: 0.9),
+          NSAttributedString.Key(kCTStrokeWidthAttributeName as String): -5,
+        ]
+        let line = CTLineCreateWithAttributedString(
+          NSAttributedString(string: city.name, attributes: attributes))
+        let bounds = CTLineGetBoundsWithOptions(line, [.useGlyphPathBounds])
+        context.textPosition = CGPoint(
+          x: cell.midX - bounds.width / 2 - bounds.minX,
+          y: cell.midY - bounds.height / 2 - bounds.minY)
+        CTLineDraw(line, context)
+      }
+      return true
+    }
+    guard drew else { throw WorldMapError.resourceAllocationFailed("city label texture") }
+
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: .rgba8Unorm, width: width, height: height, mipmapped: false)
+    descriptor.usage = .shaderRead
+    descriptor.storageMode = .shared
+    guard let texture = device.makeTexture(descriptor: descriptor) else {
+      throw WorldMapError.resourceAllocationFailed("city label texture")
+    }
+    texture.label = "WorldMap pinyin city label atlas"
+    pixels.withUnsafeBytes { bytes in
+      guard let base = bytes.baseAddress else { return }
+      texture.replace(
+        region: MTLRegionMake2D(0, 0, width, height),
+        mipmapLevel: 0,
+        withBytes: base,
+        bytesPerRow: width * 4)
+    }
+    return texture
+  }
+
+  private static func makeCityLabelPipeline(
+    device: MTLDevice, library: MTLLibrary, maxViewCount: Int
+  ) throws -> MTLRenderPipelineState {
+    guard let vertex = library.makeFunction(name: "worldMapCityLabelVertex") else {
+      throw WorldMapError.missingFunction("worldMapCityLabelVertex")
+    }
+    guard let fragment = library.makeFunction(name: "worldMapCityLabelFragment") else {
+      throw WorldMapError.missingFunction("worldMapCityLabelFragment")
+    }
+    let descriptor = MTLRenderPipelineDescriptor()
+    descriptor.vertexFunction = vertex
+    descriptor.fragmentFunction = fragment
+    descriptor.colorAttachments[0].pixelFormat = .rgba16Float
+    descriptor.depthAttachmentPixelFormat = .depth32Float
+    descriptor.maxVertexAmplificationCount = max(maxViewCount, 1)
+    if let attachment = descriptor.colorAttachments[0] {
+      attachment.isBlendingEnabled = true
+      attachment.sourceRGBBlendFactor = .one
+      attachment.sourceAlphaBlendFactor = .one
+      attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+      attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+    }
+    return try device.makeRenderPipelineState(descriptor: descriptor)
+  }
+
+  private static func makeCompassVertexBuffer(device: MTLDevice) throws -> MTLBuffer {
+    let radius: Float = 75
+    // (north, east, u, v). The shader maps north to forward (-z) and east to
+    // the viewer's right (+x), then corrects the texture for viewing below it.
+    let vertices: [SIMD4<Float>] = [
+      SIMD4<Float>(radius, -radius, 0, 0),
+      SIMD4<Float>(radius, radius, 1, 0),
+      SIMD4<Float>(-radius, -radius, 0, 1),
+      SIMD4<Float>(-radius, radius, 1, 1),
+    ]
+    guard
+      let buffer = device.makeBuffer(
+        bytes: vertices,
+        length: vertices.count * MemoryLayout<SIMD4<Float>>.stride,
+        options: .storageModeShared)
+    else { throw WorldMapError.resourceAllocationFailed("compass vertices") }
+    buffer.label = "WorldMap compass vertices"
+    return buffer
+  }
+
+  private static func makeCompassTexture(device: MTLDevice) throws -> MTLTexture {
+    let side = 1_024
+    var pixels = [UInt8](repeating: 0, count: side * side * 4)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+    let drew = pixels.withUnsafeMutableBytes { bytes -> Bool in
+      guard
+        let context = CGContext(
+          data: bytes.baseAddress,
+          width: side,
+          height: side,
+          bitsPerComponent: 8,
+          bytesPerRow: side * 4,
+          space: colorSpace,
+          bitmapInfo: bitmapInfo)
+      else { return false }
+
+      let center = CGPoint(x: 512, y: 512)
+      context.setFillColor(CGColor(red: 0.02, green: 0.04, blue: 0.08, alpha: 0.42))
+      context.fillEllipse(in: CGRect(x: 412, y: 412, width: 200, height: 200))
+      context.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.72))
+      context.setLineWidth(12)
+      context.strokeEllipse(in: CGRect(x: 424, y: 424, width: 176, height: 176))
+
+      let directions: [(label: String, tip: CGPoint, base: CGPoint, color: CGColor)] = [
+        (
+          "N", CGPoint(x: 512, y: 950), CGPoint(x: 512, y: 820),
+          CGColor(red: 1, green: 0.16, blue: 0.10, alpha: 0.96)
+        ),
+        (
+          "E", CGPoint(x: 950, y: 512), CGPoint(x: 820, y: 512),
+          CGColor(red: 1, green: 0.78, blue: 0.10, alpha: 0.94)
+        ),
+        (
+          "S", CGPoint(x: 512, y: 74), CGPoint(x: 512, y: 204),
+          CGColor(red: 0.20, green: 0.70, blue: 1, alpha: 0.94)
+        ),
+        (
+          "W", CGPoint(x: 74, y: 512), CGPoint(x: 204, y: 512),
+          CGColor(red: 0.32, green: 1, blue: 0.52, alpha: 0.94)
+        ),
+      ]
+      for direction in directions {
+        context.setStrokeColor(direction.color)
+        context.setFillColor(direction.color)
+        context.setLineWidth(30)
+        context.setLineCap(.round)
+        context.move(to: center)
+        context.addLine(to: direction.base)
+        context.strokePath()
+
+        let dx = direction.tip.x - direction.base.x
+        let dy = direction.tip.y - direction.base.y
+        let length = max(hypot(dx, dy), 1)
+        let px = -dy / length * 58
+        let py = dx / length * 58
+        context.move(to: direction.tip)
+        context.addLine(to: CGPoint(x: direction.base.x + px, y: direction.base.y + py))
+        context.addLine(to: CGPoint(x: direction.base.x - px, y: direction.base.y - py))
+        context.closePath()
+        context.fillPath()
+
+        let labelCenter = CGPoint(
+          x: direction.tip.x + dx / length * 4,
+          y: direction.tip.y + dy / length * 4)
+        drawCompassLabel(
+          direction.label,
+          center: labelCenter,
+          color: direction.color,
+          context: context)
+      }
+      return true
+    }
+    guard drew else { throw WorldMapError.resourceAllocationFailed("compass texture") }
+
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: .rgba8Unorm,
+      width: side,
+      height: side,
+      mipmapped: false)
+    descriptor.usage = .shaderRead
+    descriptor.storageMode = .shared
+    guard let texture = device.makeTexture(descriptor: descriptor) else {
+      throw WorldMapError.resourceAllocationFailed("compass texture")
+    }
+    texture.label = "WorldMap cardinal compass"
+    pixels.withUnsafeBytes { bytes in
+      guard let base = bytes.baseAddress else { return }
+      texture.replace(
+        region: MTLRegionMake2D(0, 0, side, side),
+        mipmapLevel: 0,
+        withBytes: base,
+        bytesPerRow: side * 4)
+    }
+    return texture
+  }
+
+  private static func drawCompassLabel(
+    _ text: String,
+    center: CGPoint,
+    color: CGColor,
+    context: CGContext
+  ) {
+    let font = CTFontCreateWithName("Helvetica-Bold" as CFString, 92, nil)
+    let attributes: [NSAttributedString.Key: Any] = [
+      NSAttributedString.Key(kCTFontAttributeName as String): font,
+      NSAttributedString.Key(kCTForegroundColorAttributeName as String): color,
+      NSAttributedString.Key(kCTStrokeColorAttributeName as String):
+        CGColor(red: 0, green: 0, blue: 0, alpha: 0.88),
+      NSAttributedString.Key(kCTStrokeWidthAttributeName as String): -8,
+    ]
+    let line = CTLineCreateWithAttributedString(
+      NSAttributedString(string: text, attributes: attributes))
+    let bounds = CTLineGetBoundsWithOptions(line, [.useGlyphPathBounds])
+    context.textPosition = CGPoint(
+      x: center.x - bounds.width / 2 - bounds.minX,
+      y: center.y - bounds.height / 2 - bounds.minY)
+    CTLineDraw(line, context)
+  }
+
+  private static func makeCompassPipeline(
+    device: MTLDevice,
+    library: MTLLibrary,
+    maxViewCount: Int
+  ) throws -> MTLRenderPipelineState {
+    guard let vertex = library.makeFunction(name: "worldMapCompassVertex") else {
+      throw WorldMapError.missingFunction("worldMapCompassVertex")
+    }
+    guard let fragment = library.makeFunction(name: "worldMapCompassFragment") else {
+      throw WorldMapError.missingFunction("worldMapCompassFragment")
+    }
+    let descriptor = MTLRenderPipelineDescriptor()
+    descriptor.vertexFunction = vertex
+    descriptor.fragmentFunction = fragment
+    descriptor.colorAttachments[0].pixelFormat = .rgba16Float
+    descriptor.depthAttachmentPixelFormat = .depth32Float
+    descriptor.maxVertexAmplificationCount = max(maxViewCount, 1)
+    if let attachment = descriptor.colorAttachments[0] {
+      attachment.isBlendingEnabled = true
+      attachment.sourceRGBBlendFactor = .one
+      attachment.sourceAlphaBlendFactor = .one
+      attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+      attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+    }
+    return try device.makeRenderPipelineState(descriptor: descriptor)
+  }
+
+  private static func makeCompassDepthState(device: MTLDevice) -> MTLDepthStencilState {
+    let descriptor = MTLDepthStencilDescriptor()
+    descriptor.depthCompareFunction = .greater
+    descriptor.isDepthWriteEnabled = false
+    return device.makeDepthStencilState(descriptor: descriptor)!
+  }
 
   private static func makeSkyDome(
     device: MTLDevice

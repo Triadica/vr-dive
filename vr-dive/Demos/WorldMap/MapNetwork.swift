@@ -49,8 +49,7 @@ nonisolated final class MapNetwork {
 
   private let session: URLSession
 
-  private init() {
-    let configuration = URLSessionConfiguration.ephemeral
+  init(configuration: URLSessionConfiguration = .ephemeral) {
     configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
     configuration.urlCache = nil
     configuration.timeoutIntervalForRequest = 20
@@ -59,36 +58,55 @@ nonisolated final class MapNetwork {
     session = URLSession(configuration: configuration)
   }
 
-  func get(_ url: URL) -> Data? {
+  func get(_ url: URL, isCancelled: () -> Bool = { false }) -> Data? {
     var request = URLRequest(url: url)
     request.httpMethod = "GET"
     request.cachePolicy = .reloadIgnoringLocalCacheData
-    return perform(request)
+    return perform(request, isCancelled: isCancelled)
   }
 
-  func post(_ url: URL, jsonBody: [String: Any]) -> Data? {
+  func post(_ url: URL, jsonBody: [String: Any], isCancelled: () -> Bool = { false }) -> Data? {
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
     request.cachePolicy = .reloadIgnoringLocalCacheData
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     guard let body = try? JSONSerialization.data(withJSONObject: jsonBody) else { return nil }
     request.httpBody = body
-    return perform(request)
+    return perform(request, isCancelled: isCancelled)
   }
 
-  private func perform(_ request: URLRequest) -> Data? {
+  // Callback state is protected even when cancellation races with completion.
+  private final class ResponseBox: @unchecked Sendable {
+    let lock = NSLock()
+    var data: Data?
+  }
+
+  private func perform(_ request: URLRequest, isCancelled: () -> Bool) -> Data? {
+    guard !isCancelled() else { return nil }
     let semaphore = DispatchSemaphore(value: 0)
-    var output: Data?
+    let output = ResponseBox()
     let task = session.dataTask(with: request) { data, response, _ in
+      output.lock.lock()
       if let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) {
-        output = data
+        output.data = data
       }
+      output.lock.unlock()
       semaphore.signal()
     }
     task.resume()
-    _ = semaphore.wait(timeout: .now() + 30)
-    return output
+    let deadline = ProcessInfo.processInfo.systemUptime + 31
+    while semaphore.wait(timeout: .now() + 0.05) == .timedOut {
+      if isCancelled() || ProcessInfo.processInfo.systemUptime >= deadline {
+        task.cancel()
+        return nil
+      }
+    }
+    guard !isCancelled() else { return nil }
+    output.lock.lock()
+    defer { output.lock.unlock() }
+    return output.data
   }
+
 }
 
 nonisolated struct GoogleMapsSessionResponse: Decodable {
@@ -107,18 +125,19 @@ nonisolated struct GoogleMapsSessionResponse: Decodable {
 nonisolated final class GoogleMapsTileClient {
   private let apiKey: String?
   private let proxyBase: URL?
-  private let network = MapNetwork.shared
+  private let network: MapNetwork
   private let lock = NSLock()
   private var cachedSession: String?
   private var cachedExpiry: Date?
 
-  init() {
-    apiKey = MapSecrets.googleMapsAPIKey()
-    if let proxy = MapSecrets.googleMapsProxyBaseURL() {
-      proxyBase = URL(string: proxy)
-    } else {
-      proxyBase = nil
-    }
+  init(
+    apiKey: String? = MapSecrets.googleMapsAPIKey(),
+    proxyBaseURL: URL? = MapSecrets.googleMapsProxyBaseURL().flatMap { URL(string: $0) },
+    network: MapNetwork = .shared
+  ) {
+    self.apiKey = apiKey
+    self.proxyBase = proxyBaseURL
+    self.network = network
   }
 
   /// Available directly with a key, or through a configured backend proxy.
@@ -126,10 +145,12 @@ nonisolated final class GoogleMapsTileClient {
 
   /// Returns a session token, creating one if needed. Safe to call from any
   /// background queue.
-  func sessionToken() -> String? {
+  func sessionToken(isCancelled: () -> Bool = { false }) -> String? {
     lock.lock()
     defer { lock.unlock() }
-    if let token = cachedSession, let expiry = cachedExpiry, expiry > Date() {
+    guard !isCancelled() else { return nil }
+    if let token = cachedSession, let expiry = cachedExpiry, expiry > Date().addingTimeInterval(60)
+    {
       return token
     }
     let url: URL?
@@ -145,7 +166,8 @@ nonisolated final class GoogleMapsTileClient {
     guard
       let data = network.post(
         url,
-        jsonBody: ["mapType": "satellite", "language": "en-US", "region": "US"]),
+        jsonBody: ["mapType": "satellite", "language": "en-US", "region": "US"],
+        isCancelled: isCancelled),
       let response = try? JSONDecoder().decode(GoogleMapsSessionResponse.self, from: data)
     else {
       return nil
@@ -159,8 +181,8 @@ nonisolated final class GoogleMapsTileClient {
     return response.session
   }
 
-  func satelliteTileURL(id: MapTileID) -> URL? {
-    guard let token = sessionToken() else { return nil }
+  func satelliteTileURL(id: MapTileID, isCancelled: () -> Bool = { false }) -> URL? {
+    guard let token = sessionToken(isCancelled: isCancelled) else { return nil }
     if let proxyBase {
       var components = URLComponents(
         url: proxyBase.appendingPathComponent("2dtiles/\(id.z)/\(id.x)/\(id.y)"),
@@ -173,6 +195,11 @@ nonisolated final class GoogleMapsTileClient {
       string:
         "https://tile.googleapis.com/v1/2dtiles/\(id.z)/\(id.x)/\(id.y)?session=\(token)&key=\(key)"
     )
+  }
+
+  func satelliteTileData(id: MapTileID, isCancelled: () -> Bool) -> Data? {
+    guard let url = satelliteTileURL(id: id, isCancelled: isCancelled) else { return nil }
+    return network.get(url, isCancelled: isCancelled)
   }
 
   static let attribution = "Google Maps"

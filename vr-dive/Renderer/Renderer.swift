@@ -27,6 +27,32 @@ struct VRConfiguration: CompositorLayerConfiguration {
 
     configuration.colorFormat = .rgba16Float
     configuration.depthFormat = .depth32Float
+    // Reverse-Z retains useful precision near the viewer even with a planetary
+    // far plane. Keep the compositor's valid near plane: devices and simulator
+    // runtimes reject a smaller value with unsupportedNearPlaneDistance (-104).
+    let defaultDepthRange = configuration.defaultDepthRange
+    let minimumNearPlane = capabilities.supportedMinimumNearPlaneDistance
+    let supportedNearPlane = max(
+      defaultDepthRange.y,
+      minimumNearPlane)
+    let requestedDepthRange = SIMD2<Float>(12_000_000, supportedNearPlane)
+    let depthRangeIsValid = requestedDepthRange.x.isFinite
+      && requestedDepthRange.y.isFinite
+      && requestedDepthRange.x > requestedDepthRange.y
+      && requestedDepthRange.y >= minimumNearPlane
+    if depthRangeIsValid {
+      configuration.defaultDepthRange = requestedDepthRange
+      print(
+        "[VRConfiguration] depth accepted for request: system=(far \(defaultDepthRange.x), near \(defaultDepthRange.y)), supportedMinimumNear=\(minimumNearPlane), requested=(far \(requestedDepthRange.x), near \(requestedDepthRange.y))"
+      )
+    } else {
+      print(
+        "[VRConfiguration] invalid depth request; preserving system range. system=(far \(defaultDepthRange.x), near \(defaultDepthRange.y)), supportedMinimumNear=\(minimumNearPlane), rejected=(far \(requestedDepthRange.x), near \(requestedDepthRange.y))"
+      )
+    }
+    print(
+      "[VRConfiguration] foveation=\(supportsFoveation), layouts=\(supportedLayouts), selectedLayout=\(configuration.layout), colorFormat=\(configuration.colorFormat.rawValue), depthFormat=\(configuration.depthFormat.rawValue)"
+    )
   }
 }
 
@@ -540,6 +566,9 @@ class Renderer {
       print(
         "[Renderer]  reverse-Z depthRange far=\(depthRange.x) near=\(depthRange.y)"
       )
+      if !depthRange.x.isFinite || !depthRange.y.isFinite || depthRange.x <= depthRange.y {
+        print("[Renderer] ERROR invalid drawable depth range; projection may be unusable")
+      }
       print(
         "[Renderer]  vertexAmplification requested=\(viewCount) supported=\(device.supportsVertexAmplificationCount(viewCount))"
       )
@@ -783,7 +812,8 @@ class Renderer {
     rigTransform = gameManager.updateRigState(
       deltaTime: delta,
       headTransform: deviceAnchorTransform,
-      usesLargeWorldBoost: activePattern == .gyirongDebrisFlow || activePattern == .worldMap)
+      usesLargeWorldBoost: activePattern == .gyirongDebrisFlow,
+      usesWorldMapMovement: activePattern == .worldMap)
     lastRigUpdateTime = currentTime
   }
 
