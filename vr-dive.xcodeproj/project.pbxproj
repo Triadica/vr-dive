@@ -19,28 +19,11 @@
 		9A9B19DC2ECF8286003DA309 /* Exceptions for "vr-dive" folder in "vr-dive" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
-				"Demos/DynamicBox/shaders/voxel-calabi-yau-quintic.metal",
-				"Demos/DynamicBox/shaders/voxel-roman-silk.metal",
-				"Demos/DynamicBox/shaders/voxel-logarithmic-conch.metal",
-				"Demos/DynamicBox/shaders/voxel-fibonacci-crown.metal",
-				"Demos/DynamicBox/shaders/latticino-lace-marble.metal",
-				"Demos/DynamicBox/shaders/celestial-filament-marble.metal",
 				"Demos/DynamicBox/shaders/agate-tide-marble.metal",
-				"Demos/DynamicBox/shaders/helix-ribbon-marble.metal",
-				"Demos/DynamicBox/shaders/orrery-glass-marble.metal",
-				"Demos/DynamicBox/shaders/petal-flame-marble.metal",
-				"Demos/DynamicBox/shaders/voxel-tide.metal",
-				"Demos/DynamicBox/shaders/lamellar-bloom.metal",
-				"Demos/DynamicBox/shaders/quaternion-reef.metal",
-				"Demos/DynamicBox/shaders/prismatic-plume.metal",
+				Demos/DynamicBox/shaders/apollonian.metal,
+				"Demos/DynamicBox/shaders/celestial-filament-marble.metal",
 				"Demos/DynamicBox/shaders/cell24-prism.metal",
 				"Demos/DynamicBox/shaders/clifford-lantern.metal",
-				"Demos/DynamicBox/shaders/hopf-fibration.metal",
-				"Demos/DynamicBox/shaders/s3-trefoil.metal",
-				"Demos/DynamicBox/shaders/tesseract-jewel.metal",
-				"Demos/DynamicBox/shaders/nacre-rosette.metal",
-				"Demos/DynamicBox/shaders/orbital-lace.metal",
-				Demos/DynamicBox/shaders/apollonian.metal,
 				"Demos/DynamicBox/shaders/coral-folds.metal",
 				"Demos/DynamicBox/shaders/cosine-cross-orbit.metal",
 				"Demos/DynamicBox/shaders/coxeter-rose-window.metal",
@@ -53,7 +36,9 @@
 				Demos/DynamicBox/shaders/fractree.metal,
 				Demos/DynamicBox/shaders/galaxy.metal,
 				Demos/DynamicBox/shaders/gyroid.metal,
+				"Demos/DynamicBox/shaders/helix-ribbon-marble.metal",
 				"Demos/DynamicBox/shaders/holofoil-dice.metal",
+				"Demos/DynamicBox/shaders/hopf-fibration.metal",
 				"Demos/DynamicBox/shaders/hopf-weave.metal",
 				"Demos/DynamicBox/shaders/hyper-menger.metal",
 				Demos/DynamicBox/shaders/hyper4d.metal,
@@ -64,6 +49,8 @@
 				"Demos/DynamicBox/shaders/kaleido-ribbons.metal",
 				Demos/DynamicBox/shaders/kaleidoscope.metal,
 				Demos/DynamicBox/shaders/knots.metal,
+				"Demos/DynamicBox/shaders/lamellar-bloom.metal",
+				"Demos/DynamicBox/shaders/latticino-lace-marble.metal",
 				"Demos/DynamicBox/shaders/liquid-contours.metal",
 				Demos/DynamicBox/shaders/liquids.metal,
 				"Demos/DynamicBox/shaders/mandelbox-cavern.metal",
@@ -73,21 +60,34 @@
 				Demos/DynamicBox/shaders/maze3d.metal,
 				Demos/DynamicBox/shaders/menger.metal,
 				Demos/DynamicBox/shaders/metaballs.metal,
+				"Demos/DynamicBox/shaders/nacre-rosette.metal",
 				Demos/DynamicBox/shaders/nebula.metal,
 				"Demos/DynamicBox/shaders/newton-basins-3d.metal",
+				"Demos/DynamicBox/shaders/orbital-lace.metal",
+				"Demos/DynamicBox/shaders/orrery-glass-marble.metal",
+				"Demos/DynamicBox/shaders/petal-flame-marble.metal",
 				"Demos/DynamicBox/shaders/petal-particles.metal",
 				"Demos/DynamicBox/shaders/pleated-marble.metal",
+				"Demos/DynamicBox/shaders/prismatic-plume.metal",
 				"Demos/DynamicBox/shaders/quasicrystal-filigree.metal",
 				"Demos/DynamicBox/shaders/quaternion-julia-slice.metal",
 				"Demos/DynamicBox/shaders/quaternion-julia.metal",
+				"Demos/DynamicBox/shaders/quaternion-reef.metal",
 				"Demos/DynamicBox/shaders/radial-gills.metal",
+				"Demos/DynamicBox/shaders/s3-trefoil.metal",
 				"Demos/DynamicBox/shaders/sdf-shapes.metal",
 				"Demos/DynamicBox/shaders/sediment-ribbons.metal",
 				Demos/DynamicBox/shaders/sierpinski5cell.metal,
 				"Demos/DynamicBox/shaders/space-station-bokeh.metal",
 				"Demos/DynamicBox/shaders/subdivided-cubes.metal",
+				"Demos/DynamicBox/shaders/tesseract-jewel.metal",
 				"Demos/DynamicBox/shaders/topographic-velvet.metal",
 				"Demos/DynamicBox/shaders/voronoi-cellular-foam.metal",
+				"Demos/DynamicBox/shaders/voxel-calabi-yau-quintic.metal",
+				"Demos/DynamicBox/shaders/voxel-fibonacci-crown.metal",
+				"Demos/DynamicBox/shaders/voxel-logarithmic-conch.metal",
+				"Demos/DynamicBox/shaders/voxel-roman-silk.metal",
+				"Demos/DynamicBox/shaders/voxel-tide.metal",
 				"Demos/DynamicBox/shaders/warped-mushroom.metal",
 				Demos/DynamicBox/shaders/waves.metal,
 				Info.plist,
@@ -151,6 +151,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 9A9B19DD2ECF8286003DA309 /* Build configuration list for PBXNativeTarget "vr-dive" */;
 			buildPhases = (
+				9A9B19E32ECF8284003DA309 /* Inject Google Maps Key */,
 				9A9B19E22ECF8284003DA309 /* Check DynamicBox Shaders */,
 				9A9B19C02ECF8284003DA309 /* Sources */,
 				9A9B19C12ECF8284003DA309 /* Frameworks */,
@@ -233,6 +234,26 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "SHADER_DIR=\"${SRCROOT}/vr-dive/Demos/DynamicBox\"\nif ! command -v node >/dev/null 2>&1; then\n  echo \"warning: node not found in PATH; skipping DynamicBox shader type-check (see $SHADER_DIR/check-shaders.js)\"\n  exit 0\nfi\necho \"Running DynamicBox shader type-check (node check-shaders.js)...\"\ncd \"$SHADER_DIR\" && node check-shaders.js\n";
+			showEnvVarsInLog = 0;
+		};
+		9A9B19E32ECF8284003DA309 /* Inject Google Maps Key */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Inject Google Maps Key";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${SRCROOT}/scripts/copy-google-key.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */

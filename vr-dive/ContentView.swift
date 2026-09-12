@@ -70,11 +70,25 @@ struct ControlButtonsView: View {
   @Bindable var model: PatternMenuModel
   var gameManager: GameManager
 
+  private func stepMap(
+    forward: Float = 0,
+    right: Float = 0,
+    up: Float = 0,
+    yaw: Float = 0
+  ) {
+    gameManager.applyPatternNavigationStep(
+      forward: forward,
+      right: right,
+      up: up,
+      yaw: yaw,
+      distance: 4)
+  }
+
   var body: some View {
     VStack(spacing: 18) {
       HStack(spacing: 18) {
         Button(action: {
-          if model.selectedPattern == .gyirongDebrisFlow {
+          if model.selectedPattern == .gyirongDebrisFlow || model.selectedPattern == .worldMap {
             gameManager.resetNavigation()
           }
           model.reset()
@@ -257,6 +271,117 @@ struct ControlButtonsView: View {
             .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+      }
+
+      if model.selectedPattern == .worldMap {
+        VStack(alignment: .leading, spacing: 6) {
+          Text("卫星地形漫游")
+            .font(.headline)
+          Text("以吉隆口岸 28.281051°N, 85.545404°E 为起点，用四叉树按距离与高度动态细分，近处高分辨率、远处粗粒度地加载真实地形与卫星影像（z8–z15），中心瓦片叠加更细一级卫星图，边缘裙边消除接缝，相机自动跟随地形保持离地高度。地形来自 AWS Terrain Tiles（Mapzen Terrarium，开放数据）；卫星影像来自 Google Maps Map Tiles API，仅内存显示、不落盘。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          Text("按 □ 切换漫游模式：左摇杆转向/前后，右摇杆平移/升降（决定离地高度），L1 或 R1 加速，同时按住更快。地图数据 ©Google，地形 ©OpenStreetMap 贡献者 / Mapzen。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          Text("地图数据 ©Google · 地形 AWS Terrain Tiles")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+
+          HStack(spacing: 10) {
+            Picker("飞行档位", selection: $model.mapFlightTier) {
+              ForEach(MapFlightTier.allCases) { tier in
+                Text(tier.displayName).tag(tier)
+              }
+            }
+            .pickerStyle(.menu)
+            .frame(width: 240)
+
+            Button(action: { model.mapFlightTier = model.mapFlightTier.next() }) {
+              Image(systemName: "gauge.with.dots.needle.67percent")
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("切换飞行档位")
+          }
+
+          Picker("中心清晰度", selection: $model.mapDetailLevel) {
+            ForEach(MapDetailLevel.allCases) { level in
+              Text(level.displayName).tag(level)
+            }
+          }
+          .pickerStyle(.segmented)
+          .frame(width: 320)
+
+          Picker("影像来源", selection: $model.mapImagerySource) {
+            ForEach(MapImagerySource.allCases) { source in
+              Text(source.displayName).tag(source)
+            }
+          }
+          .pickerStyle(.segmented)
+          .frame(width: 240)
+
+          Text("无手柄时用下面的按钮漫游（每次移动量随飞行档位缩放）")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+          HStack(spacing: 6) {
+            Button("前进") { stepMap(forward: 1) }
+            Button("后退") { stepMap(forward: -1) }
+            Button("左移") { stepMap(right: -1) }
+            Button("右移") { stepMap(right: 1) }
+            Button("上升") { stepMap(up: 1) }
+            Button("下降") { stepMap(up: -1) }
+            Button("左转") { stepMap(yaw: 1) }
+            Button("右转") { stepMap(yaw: -1) }
+          }
+          .buttonStyle(.bordered)
+
+          Text("状态: \(model.mapStatus.isEmpty ? "等待地图…" : model.mapStatus)")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+          HStack(spacing: 8) {
+            TextField("纬度", text: $model.mapLatitudeText)
+              .frame(width: 110)
+            TextField("经度", text: $model.mapLongitudeText)
+              .frame(width: 110)
+            Button("跳转") {
+              model.relocateFromTextFields()
+              gameManager.resetNavigation()
+            }
+            .buttonStyle(.bordered)
+            Button("填入当前") { model.copyCurrentCoordinateToTextFields() }
+              .buttonStyle(.borderless)
+            Button("加书签") { model.addCurrentBookmark() }
+              .buttonStyle(.borderless)
+          }
+
+          if !model.mapBookmarks.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+              ForEach(model.mapBookmarks) { bookmark in
+                HStack(spacing: 8) {
+                  Text(bookmark.name).font(.caption)
+                  Button("前往") {
+                    model.goToBookmark(bookmark)
+                    gameManager.resetNavigation()
+                  }
+                  .buttonStyle(.borderless)
+                  Button {
+                    model.removeBookmark(bookmark)
+                  } label: {
+                    Image(systemName: "trash")
+                  }
+                  .buttonStyle(.borderless)
+                }
+              }
+            }
+          }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .task {
+          while !Task.isCancelled {
+            model.refreshMapStatus()
+            try? await Task.sleep(for: .milliseconds(300))
+          }
+        }
       }
 
       if model.selectedPattern == .dynamicBox {

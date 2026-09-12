@@ -70,6 +70,7 @@ class GameManager {
   private var patternNavYaw: Float = 0
   private(set) var isPatternNavigationActive: Bool = false
   private(set) var patternNavTransform: simd_float4x4 = matrix_identity_float4x4
+  private var lastHeadTransform: simd_float4x4 = matrix_identity_float4x4
 
   init() {
     setupControllerObserver()
@@ -245,12 +246,69 @@ class GameManager {
     print("[GameManager] Rig and pattern navigation reset to origin")
   }
 
+  /// Enables or disables virtual pattern navigation without a controller, for
+  /// window-based controls on devices with no gamepad.
+  func setPatternNavigationActive(_ active: Bool) {
+    controllerQueue.sync {
+      isPatternNavigationActive = active
+      patternNavTransform = buildPatternNavTransform()
+    }
+    print("[GameManager] Pattern nav mode (UI): \(active ? "ON" : "OFF")")
+  }
+
+  func patternNavigationIsActive() -> Bool {
+    controllerQueue.sync { isPatternNavigationActive }
+  }
+
+  /// One discrete translation/rotation step, used by the window map controls.
+  /// `distance` is in pre-acceleration scene units; the renderer scales it by
+  /// the selected flight tier, so a tap moves proportionally at every speed.
+  func applyPatternNavigationStep(
+    forward: Float,
+    right: Float,
+    up: Float,
+    yaw: Float,
+    distance: Float
+  ) {
+    controllerQueue.sync {
+      patternNavYaw = wrapAngle(patternNavYaw + yaw)
+      let effectiveYaw = yawAngle + patternNavYaw
+      let cosYaw = cos(-effectiveYaw)
+      let sinYaw = sin(-effectiveYaw)
+      let rigRot = simd_float3x3(
+        SIMD3<Float>(cosYaw, 0, sinYaw),
+        SIMD3<Float>(0, 1, 0),
+        SIMD3<Float>(-sinYaw, 0, cosYaw)
+      )
+      let headRight = SIMD3<Float>(
+        lastHeadTransform.columns.0.x,
+        lastHeadTransform.columns.0.y,
+        lastHeadTransform.columns.0.z)
+      let headUp = SIMD3<Float>(
+        lastHeadTransform.columns.1.x,
+        lastHeadTransform.columns.1.y,
+        lastHeadTransform.columns.1.z)
+      let headForward = -SIMD3<Float>(
+        lastHeadTransform.columns.2.x,
+        lastHeadTransform.columns.2.y,
+        lastHeadTransform.columns.2.z)
+      let worldForward = rigRot * headForward
+      let worldRight = rigRot * headRight
+      let worldUp = rigRot * headUp
+      patternNavOffset -= worldForward * forward * distance
+      patternNavOffset -= worldRight * right * distance
+      patternNavOffset -= worldUp * up * distance
+      patternNavTransform = buildPatternNavTransform()
+    }
+  }
+
   func updateRigState(
     deltaTime: Float,
     headTransform: simd_float4x4,
     usesLargeWorldBoost: Bool = false
   ) -> simd_float4x4 {
     controllerQueue.sync {
+      lastHeadTransform = headTransform
       let primaryStickInput = applyDeadZone(controllerState.leftStick)
       let secondaryStickInput = applyDeadZone(controllerState.rightStick)
       let superBoostActive = controllerState.leftShoulder && controllerState.rightShoulder
