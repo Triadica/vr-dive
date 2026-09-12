@@ -60,6 +60,11 @@ class GameManager {
   // applies one boost; holding both intentionally stacks the same multiplier
   // twice, so the combined tier is the square of the single-button tier.
   private let largeWorldShoulderMovementMultiplier: Float = 16.0
+  // Keep the world-map base speed at 4x. Each shoulder adds another 8x on top
+  // of the existing large-world shoulder boost; this is twice its previous
+  // contribution per shoulder, and therefore 4x when L1 + R1 are held.
+  private let worldMapBaseMovementMultiplier: Float = 4.0
+  private let worldMapShoulderMovementMultiplier: Float = 8.0
 
   private(set) var playerOffset: SIMD3<Float> = .zero
   private(set) var yawAngle: Float = 0
@@ -305,7 +310,8 @@ class GameManager {
   func updateRigState(
     deltaTime: Float,
     headTransform: simd_float4x4,
-    usesLargeWorldBoost: Bool = false
+    usesLargeWorldBoost: Bool = false,
+    usesWorldMapMovement: Bool = false
   ) -> simd_float4x4 {
     controllerQueue.sync {
       lastHeadTransform = headTransform
@@ -313,9 +319,19 @@ class GameManager {
       let secondaryStickInput = applyDeadZone(controllerState.rightStick)
       let superBoostActive = controllerState.leftShoulder && controllerState.rightShoulder
       let movementMultiplier: Float
-      if usesLargeWorldBoost {
+      if usesWorldMapMovement {
+        let existingLargeWorldMultiplier =
+          (controllerState.leftShoulder ? largeWorldShoulderMovementMultiplier : 1)
+          * (controllerState.rightShoulder ? largeWorldShoulderMovementMultiplier : 1)
+        let additionalWorldMapMultiplier =
+          worldMapBaseMovementMultiplier
+          * (controllerState.leftShoulder ? worldMapShoulderMovementMultiplier : 1)
+          * (controllerState.rightShoulder ? worldMapShoulderMovementMultiplier : 1)
+        movementMultiplier = existingLargeWorldMultiplier * additionalWorldMapMultiplier
+      } else if usesLargeWorldBoost {
         if controllerState.leftShoulder && controllerState.rightShoulder {
-          movementMultiplier = largeWorldShoulderMovementMultiplier
+          movementMultiplier =
+            largeWorldShoulderMovementMultiplier
             * largeWorldShoulderMovementMultiplier
         } else if controllerState.leftShoulder || controllerState.rightShoulder {
           movementMultiplier = largeWorldShoulderMovementMultiplier

@@ -606,7 +606,7 @@ final class PatternCoordinator {
   }
 
   private let queue = DispatchQueue(label: "vr-dive.pattern.coordinator", attributes: .concurrent)
-  private var _current: VisualPatternKind = .infiniteMandelbulbZoom
+  private var _current: VisualPatternKind = .worldMap
   private var _isPaused: Bool = false
   private var _shouldReset: Bool = false
   private var _speedMultiplier: Float = 1.0
@@ -880,11 +880,6 @@ final class PatternMenuModel {
   /// Live readout published by the renderer (zoom, clearance, coordinates).
   var mapStatus: String = ""
   var mapCurrentCoordinate: MapCoordinate?
-  var mapBookmarks: [MapBookmark] = []
-  var mapLatitudeText: String = ""
-  var mapLongitudeText: String = ""
-
-  private static let mapBookmarksKey = "vr-dive.worldmap.bookmarks"
 
   func refreshMapStatus() {
     let status = coordinator.mapStatus()
@@ -897,50 +892,6 @@ final class PatternMenuModel {
   func relocateToCoordinate(_ coordinate: MapCoordinate) {
     guard coordinate.isValid else { return }
     coordinator.setMapRelocateRequest(coordinate)
-  }
-
-  func relocateFromTextFields() {
-    let latitude = Double(mapLatitudeText.trimmingCharacters(in: .whitespaces))
-    let longitude = Double(mapLongitudeText.trimmingCharacters(in: .whitespaces))
-    guard let latitude, let longitude else { return }
-    relocateToCoordinate(MapCoordinate(latitude: latitude, longitude: longitude))
-  }
-
-  func copyCurrentCoordinateToTextFields() {
-    guard let coordinate = mapCurrentCoordinate else { return }
-    mapLatitudeText = String(format: "%.5f", coordinate.latitude)
-    mapLongitudeText = String(format: "%.5f", coordinate.longitude)
-  }
-
-  func addCurrentBookmark() {
-    guard let coordinate = mapCurrentCoordinate else { return }
-    let name = String(format: "%.4f, %.4f", coordinate.latitude, coordinate.longitude)
-    mapBookmarks.append(
-      MapBookmark(name: name, latitude: coordinate.latitude, longitude: coordinate.longitude))
-    saveMapBookmarks()
-  }
-
-  func removeBookmark(_ bookmark: MapBookmark) {
-    mapBookmarks.removeAll { $0.id == bookmark.id }
-    saveMapBookmarks()
-  }
-
-  func goToBookmark(_ bookmark: MapBookmark) {
-    relocateToCoordinate(bookmark.coordinate)
-  }
-
-  private func saveMapBookmarks() {
-    if let data = try? JSONEncoder().encode(mapBookmarks) {
-      UserDefaults.standard.set(data, forKey: Self.mapBookmarksKey)
-    }
-  }
-
-  private func loadMapBookmarks() {
-    guard
-      let data = UserDefaults.standard.data(forKey: Self.mapBookmarksKey),
-      let bookmarks = try? JSONDecoder().decode([MapBookmark].self, from: data)
-    else { return }
-    mapBookmarks = bookmarks
   }
 
   // ─── DynamicBox ──────────────────────────────────────────────────────────
@@ -974,7 +925,8 @@ final class PatternMenuModel {
       dynamicBoxSelectedShader = dynamicBoxAvailableShaders[0]
       return
     }
-    dynamicBoxSelectedShader = dynamicBoxAvailableShaders[(index + 1) % dynamicBoxAvailableShaders.count]
+    dynamicBoxSelectedShader =
+      dynamicBoxAvailableShaders[(index + 1) % dynamicBoxAvailableShaders.count]
   }
 
   func refreshShaderList() {
@@ -1026,7 +978,6 @@ final class PatternMenuModel {
     self.mapFlightTier = coordinator.mapFlightTier()
     self.mapDetailLevel = coordinator.mapDetailLevel()
     self.mapImagerySource = coordinator.mapImagerySource()
-    loadMapBookmarks()
   }
 
   func refreshFromCoordinator() {
@@ -1120,20 +1071,117 @@ nonisolated struct MapCoordinate: Equatable {
   }
 }
 
-struct MapBookmark: Codable, Identifiable, Equatable {
-  var id: UUID = UUID()
-  var name: String
-  var latitude: Double
-  var longitude: Double
+enum ChinaMountainDestination: String, CaseIterable, Identifiable {
+  case taishan
+  case huashan
+  case hengshanHunan
+  case hengshanShanxi
+  case songshan
+  case huangshan
+  case emeishan
+  case wuyishan
+  case changbaishan
+  case yulongxueshan
+  case siguniangshan
+  case gonggashan
+  case everest
+  case zijinshan
+  case huaguoshan
+  case yushanJiangsu
+  case qionglongshan
+  case tianmushan
+  case moganshan
+  case yandangshan
+  case tiantaishan
+  case putuoshan
+  case xuedoushan
+  case damingshan
+  case sheshan
+
+  var id: String { rawValue }
+
+  static let jiangzhehu: [Self] = [
+    .zijinshan,
+    .huaguoshan,
+    .yushanJiangsu,
+    .qionglongshan,
+    .tianmushan,
+    .moganshan,
+    .yandangshan,
+    .tiantaishan,
+    .putuoshan,
+    .xuedoushan,
+    .damingshan,
+    .sheshan,
+  ]
+
+  static var otherMountains: [Self] {
+    allCases.filter { !jiangzhehu.contains($0) }
+  }
+
+  var displayName: String {
+    switch self {
+    case .taishan: return "泰山 · 山东"
+    case .huashan: return "华山 · 陕西"
+    case .hengshanHunan: return "衡山 · 湖南"
+    case .hengshanShanxi: return "恒山 · 山西"
+    case .songshan: return "嵩山 · 河南"
+    case .huangshan: return "黄山 · 安徽"
+    case .emeishan: return "峨眉山 · 四川"
+    case .wuyishan: return "武夷山 · 福建"
+    case .changbaishan: return "长白山天池 · 吉林"
+    case .yulongxueshan: return "玉龙雪山 · 云南"
+    case .siguniangshan: return "四姑娘山 · 四川"
+    case .gonggashan: return "贡嘎山 · 四川"
+    case .everest: return "珠穆朗玛峰 · 西藏"
+    case .zijinshan: return "紫金山 · 江苏南京"
+    case .huaguoshan: return "花果山 · 江苏连云港"
+    case .yushanJiangsu: return "虞山 · 江苏常熟"
+    case .qionglongshan: return "穹窿山 · 江苏苏州"
+    case .tianmushan: return "天目山 · 浙江杭州"
+    case .moganshan: return "莫干山 · 浙江湖州"
+    case .yandangshan: return "雁荡山 · 浙江温州"
+    case .tiantaishan: return "天台山 · 浙江台州"
+    case .putuoshan: return "普陀山 · 浙江舟山"
+    case .xuedoushan: return "雪窦山 · 浙江宁波"
+    case .damingshan: return "大明山 · 浙江杭州"
+    case .sheshan: return "佘山 · 上海"
+    }
+  }
 
   var coordinate: MapCoordinate {
-    MapCoordinate(latitude: latitude, longitude: longitude)
+    switch self {
+    case .taishan: return MapCoordinate(latitude: 36.255, longitude: 117.101)
+    case .huashan: return MapCoordinate(latitude: 34.483, longitude: 110.083)
+    case .hengshanHunan: return MapCoordinate(latitude: 27.254, longitude: 112.655)
+    case .hengshanShanxi: return MapCoordinate(latitude: 39.674, longitude: 113.724)
+    case .songshan: return MapCoordinate(latitude: 34.489, longitude: 112.960)
+    case .huangshan: return MapCoordinate(latitude: 30.134, longitude: 118.168)
+    case .emeishan: return MapCoordinate(latitude: 29.520, longitude: 103.333)
+    case .wuyishan: return MapCoordinate(latitude: 27.720, longitude: 117.680)
+    case .changbaishan: return MapCoordinate(latitude: 42.006, longitude: 128.057)
+    case .yulongxueshan: return MapCoordinate(latitude: 27.100, longitude: 100.180)
+    case .siguniangshan: return MapCoordinate(latitude: 31.100, longitude: 102.900)
+    case .gonggashan: return MapCoordinate(latitude: 29.595, longitude: 101.879)
+    case .everest: return MapCoordinate(latitude: 27.988, longitude: 86.925)
+    case .zijinshan: return MapCoordinate(latitude: 32.071, longitude: 118.853)
+    case .huaguoshan: return MapCoordinate(latitude: 34.650, longitude: 119.290)
+    case .yushanJiangsu: return MapCoordinate(latitude: 31.671, longitude: 120.697)
+    case .qionglongshan: return MapCoordinate(latitude: 31.267, longitude: 120.417)
+    case .tianmushan: return MapCoordinate(latitude: 30.394, longitude: 119.433)
+    case .moganshan: return MapCoordinate(latitude: 30.630, longitude: 119.826)
+    case .yandangshan: return MapCoordinate(latitude: 28.370, longitude: 121.060)
+    case .tiantaishan: return MapCoordinate(latitude: 29.179, longitude: 121.042)
+    case .putuoshan: return MapCoordinate(latitude: 30.011, longitude: 122.386)
+    case .xuedoushan: return MapCoordinate(latitude: 29.683, longitude: 121.117)
+    case .damingshan: return MapCoordinate(latitude: 30.039, longitude: 118.990)
+    case .sheshan: return MapCoordinate(latitude: 31.096, longitude: 121.187)
+    }
   }
 }
 
 /// Flight-speed presets for the streaming world map.
-/// movement is scaled by `speedScale`, so 50x is a slow walk over a city and
-/// 20000x crosses continents in seconds.
+/// The selected tier scales map-space movement after controller acceleration.
 enum MapFlightTier: String, CaseIterable, Identifiable {
   case stroll
   case cruise
@@ -1144,19 +1192,19 @@ enum MapFlightTier: String, CaseIterable, Identifiable {
 
   var displayName: String {
     switch self {
-    case .stroll: return "慢速 50×"
-    case .cruise: return "巡航 250×"
-    case .fast: return "高速 2000×"
-    case .continental: return "洲际 20000×"
+    case .stroll: return "慢速 200×"
+    case .cruise: return "巡航 1000×"
+    case .fast: return "高速 8000×"
+    case .continental: return "洲际 80000×"
     }
   }
 
   var speedScale: Float {
     switch self {
-    case .stroll: return 50
-    case .cruise: return 250
-    case .fast: return 2_000
-    case .continental: return 20_000
+    case .stroll: return 200
+    case .cruise: return 1_000
+    case .fast: return 8_000
+    case .continental: return 80_000
     }
   }
 
